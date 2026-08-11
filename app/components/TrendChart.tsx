@@ -104,11 +104,11 @@ export default function TrendChart({ history }: { history: HistoryData }) {
     <div className="trend-chart-wrap">
       <div className="trend-metrics">
         <div>
-          <span>{history.isDemo ? "最新模拟值" : "最新历史日净流入"}<small>{summary.latestDate ? ` · ${summary.latestDate.slice(5)}` : ""}</small></span>
+          <span>最新历史日净流入<small>{summary.latestDate ? ` · ${summary.latestDate.slice(5)}` : ""}</small></span>
           <strong className={summary.latest >= 0 ? "up" : "down"}>{formatYi(summary.latest)}</strong>
         </div>
-        <div><span>{history.isDemo ? "三个月模拟累计" : "三个月累计"}</span><strong className={summary.total >= 0 ? "up" : "down"}>{formatYi(summary.total)}</strong></div>
-        <div><span>{history.isDemo ? "模拟净流入日" : "净流入交易日"}</span><strong>{summary.positiveDays}<small> / {summary.count} 天</small></strong></div>
+        <div><span>三个月累计</span><strong className={summary.total >= 0 ? "up" : "down"}>{formatYi(summary.total)}</strong></div>
+        <div><span>净流入交易日</span><strong>{summary.positiveDays}<small> / {summary.count} 天</small></strong></div>
       </div>
       <div className="trend-legend">
         <span><i className="legend-bar" />每日资金净流入</span>

@@ -11,8 +11,20 @@ $webUrl = "http://${webAddress}:${webPort}"
 $apiHealthUrl = "http://127.0.0.1:${apiPort}/api/health"
 $apiProcess = $null
 $webProcess = $null
+$transcriptStarted = $false
+$startupLog = Join-Path $projectRoot "startup-windows.log"
+$chinaRegistry = "https://registry.npmmirror.com"
+$officialRegistry = "https://registry.npmjs.org"
 
 Set-Location -LiteralPath $projectRoot
+
+try {
+    Start-Transcript -LiteralPath $startupLog -Append | Out-Null
+    $transcriptStarted = $true
+}
+catch {
+    # Logging is helpful for support, but a locked log file must not block startup.
+}
 
 function Test-LocalUrl {
     param([Parameter(Mandatory = $true)][string]$Url)
@@ -64,6 +76,74 @@ function Stop-StartedProcessTree {
     }
 }
 
+function Test-WindowsWebPackages {
+    param(
+        [Parameter(Mandatory = $true)][string]$VinextScript,
+        [Parameter(Mandatory = $true)][string]$NodeArchitecture
+    )
+
+    if (-not (Test-Path -LiteralPath $VinextScript -PathType Leaf)) {
+        return $false
+    }
+
+    $pnpmModules = Join-Path $projectRoot "node_modules\.pnpm"
+    if (-not (Test-Path -LiteralPath $pnpmModules -PathType Container)) {
+        return $false
+    }
+
+    $nativePackagePattern = "@next+swc-win32-${NodeArchitecture}-msvc@*"
+    $nativePackages = @(
+        Get-ChildItem `
+            -LiteralPath $pnpmModules `
+            -Directory `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Name -like $nativePackagePattern }
+    )
+
+    return $nativePackages.Count -gt 0
+}
+
+function Install-WindowsWebPackages {
+    param(
+        [Parameter(Mandatory = $true)][string]$NpxExecutable,
+        [Parameter(Mandatory = $true)][string]$VinextScript,
+        [Parameter(Mandatory = $true)][string]$NodeArchitecture
+    )
+
+    $registries = @($chinaRegistry, $officialRegistry)
+    $previousRegistry = $env:npm_config_registry
+
+    try {
+        foreach ($registry in $registries) {
+            Write-Host "Installing from ${registry} ..." -ForegroundColor Yellow
+            $env:npm_config_registry = $registry
+
+            & $NpxExecutable `
+                --yes `
+                "--registry=${registry}" `
+                "pnpm@11.9.0" `
+                install `
+                --frozen-lockfile `
+                "--registry=${registry}"
+
+            if (
+                $LASTEXITCODE -eq 0 -and
+                (Test-WindowsWebPackages `
+                    -VinextScript $VinextScript `
+                    -NodeArchitecture $NodeArchitecture)
+            ) {
+                return
+            }
+
+            Write-Host "That download source did not complete. Trying the next source..." -ForegroundColor DarkYellow
+        }
+    }
+    finally {
+        $env:npm_config_registry = $previousRegistry
+    }
+
+    throw "Package installation failed. Check the internet connection, then try again. Details were saved in startup-windows.log."
+}
+
 try {
     Write-Host "Starting Fund Flow..." -ForegroundColor Cyan
 
@@ -97,8 +177,13 @@ try {
         throw "Node.js is too old. Install Node.js 22.13 or newer."
     }
 
+    $nodeArchitecture = (& $nodeExecutable -p "process.arch").Trim()
+    if ($nodeArchitecture -notin @("x64", "arm64")) {
+        throw "This Windows processor type (${nodeArchitecture}) is not supported by the included web packages."
+    }
+
     $vinextScript = Join-Path $projectRoot "node_modules\vinext\dist\cli.js"
-    if (-not (Test-Path -LiteralPath $vinextScript)) {
+    if (-not (Test-WindowsWebPackages -VinextScript $vinextScript -NodeArchitecture $nodeArchitecture)) {
         $npxCommand = Get-Command "npx.cmd" -ErrorAction SilentlyContinue
         if ($null -eq $npxCommand) {
             $npxCommand = Get-Command "npx.exe" -ErrorAction SilentlyContinue
@@ -107,12 +192,21 @@ try {
             throw "npx was not found. Reinstall Node.js and try again."
         }
 
-        Write-Host "First run: installing the web app packages. This may take a few minutes..." -ForegroundColor Yellow
-        $npxExecutable = $npxCommand.Source
-        & $npxExecutable --yes "pnpm@11.9.0" install --frozen-lockfile
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $vinextScript)) {
-            throw "Package installation failed. Check the internet connection and try again."
+        $nodeModules = Join-Path $projectRoot "node_modules"
+        if (Test-Path -LiteralPath $nodeModules) {
+            Write-Host "The copied packages are incomplete or belong to another operating system." -ForegroundColor Yellow
+            Write-Host "Rebuilding them safely for this Windows computer..." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $nodeModules -Recurse -Force
         }
+        else {
+            Write-Host "First run: installing the web app packages. This may take a few minutes..." -ForegroundColor Yellow
+        }
+
+        $npxExecutable = $npxCommand.Source
+        Install-WindowsWebPackages `
+            -NpxExecutable $npxExecutable `
+            -VinextScript $vinextScript `
+            -NodeArchitecture $nodeArchitecture
     }
 
     if ($null -eq (Get-Command "ffmpeg.exe" -ErrorAction SilentlyContinue)) {
@@ -182,4 +276,12 @@ catch {
 finally {
     Stop-StartedProcessTree -StartedProcess $webProcess
     Stop-StartedProcessTree -StartedProcess $apiProcess
+    if ($transcriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
+        }
+        catch {
+            # Windows may already have closed the transcript during shutdown.
+        }
+    }
 }

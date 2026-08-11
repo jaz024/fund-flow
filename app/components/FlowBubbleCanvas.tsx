@@ -405,10 +405,12 @@ export default function FlowBubbleCanvas({ date, frames, indexes, duration = 28 
     if (!frames.length || !playing) return;
     if (frames.length === 1) {
       renderPosition.current = 0;
-      setFrameIndex(0);
       draw(0, 0);
-      setPlaying(false);
-      return;
+      const stateUpdateId = requestAnimationFrame(() => {
+        setFrameIndex(0);
+        setPlaying(false);
+      });
+      return () => cancelAnimationFrame(stateUpdateId);
     }
     let animationId = 0;
     const animate = (timestamp: number) => {
@@ -441,15 +443,18 @@ export default function FlowBubbleCanvas({ date, frames, indexes, duration = 28 
     const position = Math.min(renderPosition.current, lastPosition);
     const index = Math.min(lastPosition, Math.floor(position));
     renderPosition.current = position;
-    setFrameIndex(index);
     draw(index, position - index);
+    const stateUpdateId = requestAnimationFrame(() => setFrameIndex(index));
     const onResize = () => {
       const position = renderPosition.current;
       const index = Math.min(frames.length - 1, Math.floor(position));
       draw(index, position - index);
     };
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    return () => {
+      cancelAnimationFrame(stateUpdateId);
+      window.removeEventListener("resize", onResize);
+    };
   }, [draw, frames.length]);
 
   const toggle = () => {

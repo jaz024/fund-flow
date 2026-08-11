@@ -95,14 +95,8 @@ export default function TrendsPage() {
         <div className="trend-content">
           <div className="trend-title-row">
             <div><span className="eyebrow">CAPITAL FLOW HISTORY</span><h2>{selected?.name || "选择一个板块"}</h2></div>
-            <span className={`source-pill ${history?.isDemo ? "demo" : ""}`}><i />{history?.isDemo ? "模拟趋势 · 非真实行情" : history?.source || "等待数据"}</span>
+            <span className="source-pill"><i />{history?.source || "等待真实数据"}</span>
           </div>
-          {history?.isDemo && (
-            <div className="history-demo-warning" role="status">
-              <strong>历史行情暂未获取</strong>
-              <span>右侧图表及汇总为模拟数据，不能与左侧的今日真实盘中净额直接比较。</span>
-            </div>
-          )}
           {loading && !history ? (
             <div className="loading-panel"><span className="loading-orbit" /><strong>正在载入趋势</strong><p>整理近三个月交易日数据…</p></div>
           ) : history ? <TrendChart history={history} /> : null}

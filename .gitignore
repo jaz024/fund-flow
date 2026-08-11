@@ -40,10 +40,15 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/startup-windows.log
+/fund-flow-windows-transfer-*.zip
 
 # local runtime data
 __pycache__/
 *.pyc
 *.tsbuildinfo
 /data/cache/*.json
+/data/*.sqlite3
+/data/*.sqlite3-shm
+/data/*.sqlite3-wal
 /output/*.mp4

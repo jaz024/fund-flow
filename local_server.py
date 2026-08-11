@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime as dt
-import hashlib
 import html
 import json
 import math
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -29,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from market_store import MarketStore
+
 
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / "data" / "cache"
@@ -39,18 +39,25 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("FUND_FLOW_API_PORT", "8765"))
 SOURCE_NAME = "东方财富公开行情"
+EASTMONEY_MINUTE_SOURCE = "东方财富真实分钟资金（延时）"
 THS_SOURCE_NAME = "同花顺公开网页"
+EASTMONEY_UT = "b2884a393a59ad64002292a3e90d46a5"
+EASTMONEY_LIVE_HOST = "https://push2.eastmoney.com"
+EASTMONEY_DELAY_HOST = "https://push2delay.eastmoney.com"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
 )
 HEADERS = {
     "User-Agent": USER_AGENT,
-    "Referer": "https://quote.eastmoney.com/center/",
+    "Referer": "https://data.eastmoney.com/bkzj/",
     "Accept": "application/json,text/plain,*/*",
 }
 
 _CACHE_LOCK = threading.Lock()
+_COLLECTION_LOCK = threading.RLock()
+_REPLAY_LOCK = threading.Lock()
+STORE = MarketStore(Path(os.environ.get("FUND_FLOW_DB_PATH", str(ROOT / "data" / "fund-flow.sqlite3"))))
 
 
 class DataSourceError(RuntimeError):
@@ -65,7 +72,12 @@ def json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def fetch_json(base_url: str, params: dict[str, Any], attempts: int = 3) -> dict[str, Any]:
+def fetch_json(
+    base_url: str,
+    params: dict[str, Any],
+    attempts: int = 3,
+    referer: str | None = None,
+) -> dict[str, Any]:
     query = urllib.parse.urlencode(params, safe=":,+!")
     url = f"{base_url}?{query}"
     last_error: Exception | None = None
@@ -83,7 +95,7 @@ def fetch_json(base_url: str, params: dict[str, Any], attempts: int = 3) -> dict
                         "-H",
                         f"User-Agent: {USER_AGENT}",
                         "-H",
-                        f"Referer: {HEADERS['Referer']}",
+                        f"Referer: {referer or HEADERS['Referer']}",
                         "-H",
                         f"Accept: {HEADERS['Accept']}",
                         url,
@@ -95,7 +107,8 @@ def fetch_json(base_url: str, params: dict[str, Any], attempts: int = 3) -> dict
                     raise DataSourceError(completed.stderr.decode("utf-8", errors="replace").strip())
                 raw = completed.stdout.decode("utf-8", errors="replace")
             else:
-                request = urllib.request.Request(url, headers=HEADERS)
+                request_headers = {**HEADERS, "Referer": referer or HEADERS["Referer"]}
+                request = urllib.request.Request(url, headers=request_headers)
                 with urllib.request.urlopen(request, timeout=22) as response:
                     raw = response.read().decode("utf-8", errors="replace")
             payload = json.loads(raw)
@@ -180,10 +193,47 @@ def to_float(value: Any, fallback: float = 0.0) -> float:
     return fallback
 
 
+def fetch_eastmoney_json(
+    path: str,
+    params: dict[str, Any],
+    *,
+    prefer_delayed: bool = False,
+    attempts: int = 2,
+) -> dict[str, Any]:
+    """Try both official public quote hosts without changing data semantics."""
+    hosts = (
+        (EASTMONEY_DELAY_HOST, EASTMONEY_LIVE_HOST)
+        if prefer_delayed
+        else (EASTMONEY_LIVE_HOST, EASTMONEY_DELAY_HOST)
+    )
+    errors: list[str] = []
+    for host in hosts:
+        try:
+            return fetch_json(
+                f"{host}{path}",
+                params,
+                attempts=attempts,
+                referer="https://data.eastmoney.com/bkzj/",
+            )
+        except Exception as exc:
+            errors.append(f"{host}: {exc}")
+    raise DataSourceError("；".join(errors) or "东方财富公开行情暂不可用")
+
+
+def validate_rankings(rows: list[dict[str, Any]], source_label: str) -> list[dict[str, Any]]:
+    unique_codes = {str(item.get("code") or "") for item in rows}
+    if len(unique_codes) < 60:
+        raise DataSourceError(
+            f"{source_label}返回的板块列表不完整"
+            f"（仅取得 {len(unique_codes)} 个板块）"
+        )
+    return rows
+
+
 def board_rank(category: str, order_desc: bool, limit: int = 120) -> list[dict[str, Any]]:
     board_type = "2" if category == "industry" else "3"
-    payload = fetch_json(
-        "https://push2.eastmoney.com/api/qt/clist/get",
+    payload = fetch_eastmoney_json(
+        "/api/qt/clist/get",
         {
             "pn": 1,
             "pz": limit,
@@ -194,6 +244,7 @@ def board_rank(category: str, order_desc: bool, limit: int = 120) -> list[dict[s
             "fid": "f62",
             "fs": f"m:90+t:{board_type}",
             "fields": "f12,f14,f2,f3,f62,f66,f72,f78,f84,f124",
+            "ut": EASTMONEY_UT,
         },
     )
     rows = payload.get("data", {}).get("diff") or []
@@ -215,6 +266,7 @@ def board_rank(category: str, order_desc: bool, limit: int = 120) -> list[dict[s
                 "largeFlow": to_float(row.get("f72")),
                 "mediumFlow": to_float(row.get("f78")),
                 "smallFlow": to_float(row.get("f84")),
+                "sourceTimestamp": int(to_float(row.get("f124"))),
                 "dataSource": SOURCE_NAME,
             }
         )
@@ -332,6 +384,7 @@ def ths_board_rank(category: str, order_desc: bool) -> list[dict[str, Any]]:
                 "largeFlow": inflow_yi * 100_000_000,
                 "mediumFlow": -outflow_yi * 100_000_000,
                 "smallFlow": 0.0,
+                "sourceTimestamp": 0,
                 "dataSource": THS_SOURCE_NAME,
             }
         )
@@ -350,13 +403,16 @@ def fetch_ths_rankings() -> list[dict[str, Any]]:
             except Exception as exc:
                 errors.append(exc)
             time.sleep(0.12)
+    if errors:
+        raise DataSourceError(f"同花顺板块列表抓取不完整：{errors[0]}")
     if not rows:
         raise DataSourceError(str(errors[0]) if errors else "未获取到同花顺板块资金数据")
     deduped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         key = (row["category"], row["name"])
         deduped[key] = row
-    return sorted(deduped.values(), key=lambda item: item["mainFlow"], reverse=True)
+    result = sorted(deduped.values(), key=lambda item: item["mainFlow"], reverse=True)
+    return validate_rankings(result, THS_SOURCE_NAME)
 
 
 def fetch_all_rankings() -> list[dict[str, Any]]:
@@ -371,6 +427,11 @@ def fetch_all_rankings() -> list[dict[str, Any]]:
             except Exception as exc:  # best-effort across the two public lists
                 errors.append(exc)
             time.sleep(0.18)
+    if errors:
+        try:
+            return fetch_ths_rankings()
+        except Exception as ths_error:
+            raise DataSourceError(f"东方财富列表不完整：{errors[0]}；同花顺备用源失败：{ths_error}") from ths_error
     if not rows:
         return fetch_ths_rankings()
     deduped: dict[str, dict[str, Any]] = {}
@@ -378,19 +439,21 @@ def fetch_all_rankings() -> list[dict[str, Any]]:
         existing = deduped.get(row["code"])
         if existing is None or abs(row["mainFlow"]) > abs(existing["mainFlow"]):
             deduped[row["code"]] = row
-    return sorted(deduped.values(), key=lambda item: item["mainFlow"], reverse=True)
+    result = sorted(deduped.values(), key=lambda item: item["mainFlow"], reverse=True)
+    return validate_rankings(result, SOURCE_NAME)
 
 
 def fetch_indexes() -> list[dict[str, Any]]:
     definitions = [("000001", "上证指数"), ("399001", "深证成指"), ("899050", "北证50")]
     try:
-        payload = fetch_json(
-            "https://push2.eastmoney.com/api/qt/ulist.np/get",
+        payload = fetch_eastmoney_json(
+            "/api/qt/ulist.np/get",
             {
                 "fltt": 2,
                 "invt": 2,
                 "fields": "f12,f14,f2,f3",
                 "secids": "1.000001,0.399001,0.899050",
+                "ut": EASTMONEY_UT,
             },
         )
         rows = payload.get("data", {}).get("diff") or []
@@ -427,83 +490,99 @@ def fetch_indexes() -> list[dict[str, Any]]:
         ]
 
 
-def demo_rankings() -> list[dict[str, Any]]:
-    names = [
-        "算力", "云计算", "人工智能", "电力", "白酒", "有色金属", "保险", "银行",
-        "煤炭开采", "证券", "AI应用", "AI智能体", "物联网", "国产芯片", "半导体",
-        "5G", "商业航天", "存储芯片", "机器人", "消费电子", "电子元件", "新能源车",
-        "锂电池", "PCB", "光纤", "低空经济", "固态电池", "通信设备", "光伏", "储能",
-    ]
-    seed = int(now_cn().strftime("%Y%m%d"))
-    rng = random.Random(seed)
-    rows = []
-    for index, name in enumerate(names):
-        sign = 1 if index < 13 else -1
-        amount = sign * (4.5 + rng.random() * 77)
-        rows.append(
-            {
-                "code": f"DEMO{index:03d}",
-                "name": name,
-                "category": "概念" if index % 3 else "行业",
-                "price": 1000 + rng.random() * 900,
-                "changePct": sign * (0.2 + rng.random() * 4.8),
-                "mainFlow": amount * 100_000_000,
-                "superFlow": amount * 55_000_000,
-                "largeFlow": amount * 45_000_000,
-                "mediumFlow": -amount * 20_000_000,
-                "smallFlow": -amount * 80_000_000,
-            }
-        )
-    return sorted(rows, key=lambda item: item["mainFlow"], reverse=True)
+def source_key(source_label: str) -> str:
+    if "同花顺" in source_label:
+        return "ths"
+    if "东方财富" in source_label:
+        return "eastmoney"
+    if "新浪" in source_label:
+        return "sina"
+    return normalize_board_name(source_label).lower() or "unknown"
+
+
+def market_slot(updated_at: str, trading_date: str) -> str:
+    """Map a real source timestamp to the latest completed five-minute slot."""
+    try:
+        observed = dt.datetime.fromisoformat(updated_at)
+    except (TypeError, ValueError):
+        observed = now_cn()
+    try:
+        data_date = dt.date.fromisoformat(trading_date)
+    except (TypeError, ValueError):
+        data_date = observed.date()
+    if data_date < observed.date():
+        return "15:00"
+    minute_of_day = observed.hour * 60 + observed.minute
+    if minute_of_day < 9 * 60 + 35:
+        return ""
+    if minute_of_day <= 11 * 60 + 30:
+        floored = minute_of_day - minute_of_day % 5
+    elif minute_of_day < 13 * 60 + 5:
+        return "11:30"
+    elif minute_of_day <= 15 * 60:
+        floored = minute_of_day - minute_of_day % 5
+    else:
+        return "15:00"
+    return f"{floored // 60:02d}:{floored % 60:02d}"
+
+
+def persist_overview(result: dict[str, Any]) -> None:
+    if result.get("isDemo") or not result.get("boards"):
+        return
+    slot = market_slot(str(result.get("updatedAt") or ""), str(result.get("date") or ""))
+    if not slot:
+        return
+    label = str(result.get("source") or "公开行情")
+    STORE.save_snapshot(
+        str(result["date"]),
+        slot,
+        source_key(label),
+        label,
+        str(result["updatedAt"]),
+        list(result["boards"]),
+        is_final=slot == "15:00",
+    )
 
 
 def build_overview(force: bool = False) -> dict[str, Any]:
     cache_key = "overview-latest"
     if not force:
         cached = read_cache(cache_key, max_age_seconds=180)
-        if cached:
+        if cached and not cached.get("isDemo"):
+            persist_overview(cached)
             return cached
-    is_demo = False
     warning = ""
     try:
         boards = fetch_all_rankings()
     except Exception as exc:
         cached = read_cache(cache_key)
-        if cached:
+        if cached and not cached.get("isDemo"):
             cached["warning"] = f"实时源暂不可用，显示最近缓存：{exc}"
+            persist_overview(cached)
             return cached
-        boards = demo_rankings()
-        indexes = [
-            {"code": "000001", "name": "上证指数", "price": 3814.92, "changePct": 1.35},
-            {"code": "399001", "name": "深证成指", "price": 12180.45, "changePct": 1.82},
-            {"code": "899050", "name": "北证50", "price": 1124.68, "changePct": 0.76},
+        raise DataSourceError(f"未取得经过验证的板块资金数据：{exc}") from exc
+    ranking_source = str(boards[0].get("dataSource") or SOURCE_NAME) if boards else SOURCE_NAME
+    if ranking_source == THS_SOURCE_NAME:
+        warning = "东方财富实时列表当前限流，已切换到同花顺公开网页；当日数据保持同一来源口径。"
+    try:
+        indexes = fetch_indexes()
+    except Exception as exc:
+        recent = read_cache(cache_key) or {}
+        indexes = recent.get("indexes") or [
+            {"code": "000001", "name": "上证指数", "price": 0, "changePct": 0},
+            {"code": "399001", "name": "深证成指", "price": 0, "changePct": 0},
+            {"code": "899050", "name": "北证50", "price": 0, "changePct": 0},
         ]
-        is_demo = True
-        warning = f"公开数据源暂不可用，当前为明确标注的演示数据：{exc}"
-    else:
-        ranking_source = str(boards[0].get("dataSource") or SOURCE_NAME) if boards else SOURCE_NAME
-        if ranking_source == THS_SOURCE_NAME:
-            warning = "东方财富实时列表当前限流，已自动切换到同花顺公开网页的资金净额口径。"
-        try:
-            indexes = fetch_indexes()
-        except Exception as exc:
-            recent = read_cache(cache_key) or {}
-            indexes = recent.get("indexes") or [
-                {"code": "000001", "name": "上证指数", "price": 0, "changePct": 0},
-                {"code": "399001", "name": "深证成指", "price": 0, "changePct": 0},
-                {"code": "899050", "name": "北证50", "price": 0, "changePct": 0},
-            ]
-            warning = f"{warning} 指数暂用最近缓存：{exc}".strip()
-    today = now_cn().strftime("%Y-%m-%d")
+        warning = f"{warning} 指数暂用最近已验证缓存：{exc}".strip()
+    timestamps = [int(item.get("sourceTimestamp") or 0) for item in boards]
+    source_timestamp = max(timestamps, default=0)
+    source_time = dt.datetime.fromtimestamp(source_timestamp) if source_timestamp > 0 else now_cn()
+    data_date = source_time.strftime("%Y-%m-%d")
     result = {
-        "date": today,
-        "updatedAt": now_cn().isoformat(timespec="seconds"),
-        "source": (
-            str(boards[0].get("dataSource") or SOURCE_NAME)
-            if not is_demo and boards
-            else "离线演示数据"
-        ),
-        "isDemo": is_demo,
+        "date": data_date,
+        "updatedAt": source_time.isoformat(timespec="seconds"),
+        "source": ranking_source,
+        "isDemo": False,
         "warning": warning,
         "indexes": indexes,
         "boards": boards,
@@ -514,7 +593,8 @@ def build_overview(force: bool = False) -> dict[str, Any]:
         )[:15],
     }
     write_cache(cache_key, result)
-    write_cache(f"overview-{today}", result)
+    write_cache(f"overview-{data_date}", result)
+    persist_overview(result)
     return result
 
 
@@ -523,15 +603,17 @@ def fetch_intraday_for_board(board: dict[str, Any]) -> dict[str, Any] | None:
     if not code.startswith("BK"):
         return None
     try:
-        payload = fetch_json(
-            "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+        payload = fetch_eastmoney_json(
+            "/api/qt/stock/fflow/kline/get",
             {
                 "lmt": 0,
                 "klt": 1,
                 "secid": f"90.{code}",
                 "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                "ut": EASTMONEY_UT,
             },
+            prefer_delayed=True,
             attempts=2,
         )
     except Exception:
@@ -586,61 +668,109 @@ def previous_point(points: dict[str, float], target: str) -> float | None:
     return points[max(eligible)]
 
 
-def demo_replay(overview: dict[str, Any]) -> dict[str, Any]:
-    # Keep one fixed identity set for the entire replay. A board may cross zero,
-    # but its bubble must not disappear or be replaced by the current top list.
-    boards = overview["topIn"][:15] + overview["topOut"][:15]
-    frames = []
-    times = elapsed_five_minute_times(overview.get("updatedAt", ""), overview.get("date", ""))
-    for index, label in enumerate(times):
-        progress = (index + 1) / len(times)
-        values = []
-        for board_index, board in enumerate(boards):
-            close_value = board["mainFlow"]
-            wave = math.sin(index * 0.35 + board_index * 0.7) * abs(close_value) * 0.12
-            value = close_value * (0.08 + progress * 0.92) + wave
-            values.append({**board, "mainFlow": value})
-        positives = sorted((item for item in values if item["mainFlow"] >= 0), key=lambda x: x["mainFlow"], reverse=True)
-        negatives = sorted((item for item in values if item["mainFlow"] < 0), key=lambda x: x["mainFlow"])
-        frames.append({"time": label, "boards": values, "inflow": positives, "outflow": negatives})
+def persist_intraday_series(series: list[dict[str, Any]]) -> None:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in series:
+        date_label = str(item.get("date") or "")
+        board = item.get("board") or {}
+        points = item.get("points") or {}
+        for slot in five_minute_times():
+            if slot not in points:
+                continue
+            grouped.setdefault((date_label, slot), []).append(
+                {**board, "mainFlow": to_float(points[slot])}
+            )
+    captured_at = now_cn().isoformat(timespec="seconds")
+    for (date_label, slot), boards in grouped.items():
+        STORE.save_snapshot(
+            date_label,
+            slot,
+            "eastmoney",
+            EASTMONEY_MINUTE_SOURCE,
+            captured_at,
+            boards,
+            is_final=slot == "15:00",
+        )
+
+
+def replay_source_label(source: str) -> str:
+    if source == "eastmoney":
+        return EASTMONEY_MINUTE_SOURCE
+    if source == "ths":
+        return f"{THS_SOURCE_NAME} · 本机五分钟快照"
+    if source == "sina":
+        return "新浪公开行情 · 本机五分钟快照"
+    return "本机保存的真实五分钟快照"
+
+
+def empty_replay(overview: dict[str, Any], warning: str) -> dict[str, Any]:
     return {
         "date": overview["date"],
         "updatedAt": now_cn().isoformat(timespec="seconds"),
-        "source": overview["source"],
-        "isDemo": True,
-        "warning": overview.get("warning") or "演示回放，不用于投资判断",
+        "source": "真实分时数据核验中",
+        "isDemo": False,
+        "warning": warning,
         "indexes": overview["indexes"],
-        "schemaVersion": 3,
-        "frames": frames,
+        "schemaVersion": 4,
+        "verifiedThrough": "",
+        "capturedSlots": 0,
+        "coveragePercent": 0,
+        "frames": [],
     }
 
 
-def build_replay(force: bool = False) -> dict[str, Any]:
-    today = now_cn().strftime("%Y-%m-%d")
-    cache_key = f"replay-v3-{today}"
+def collect_overview(force: bool = False) -> dict[str, Any]:
+    with _COLLECTION_LOCK:
+        return build_overview(force=force)
+
+
+def build_replay(force: bool = False, overview: dict[str, Any] | None = None) -> dict[str, Any]:
+    # The frontend requests the overview immediately before the replay. Reusing
+    # that fresh cache prevents a manual refresh from crawling the rankings twice.
+    overview = overview or collect_overview(force=False)
+    trading_date = str(overview["date"])
+    cache_key = f"replay-v4-{trading_date}"
     if not force:
         cached = read_cache(cache_key, max_age_seconds=600)
-        if cached:
+        if cached and not cached.get("isDemo") and cached.get("frames"):
             return cached
-    overview = build_overview(force=force)
-    if overview.get("isDemo"):
-        result = demo_replay(overview)
+        pending = read_cache(cache_key, max_age_seconds=60)
+        if pending and not pending.get("isDemo"):
+            return pending
+    preferred_source = source_key(str(overview.get("source") or ""))
+    selected_source, stored_series = STORE.load_intraday_series(trading_date, preferred_source)
+    stored_maximum = max((len(item.get("points") or {}) for item in stored_series), default=0)
+    if force or stored_maximum < 2:
+        candidates = overview["topIn"][:24] + overview["topOut"][:24]
+        series: list[dict[str, Any]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(fetch_intraday_for_board, board) for board in candidates]
+            for future in concurrent.futures.as_completed(futures):
+                item = future.result()
+                if item:
+                    series.append(item)
+        if series:
+            persist_intraday_series(series)
+            selected_source, stored_series = STORE.load_intraday_series(trading_date, preferred_source)
+
+    if not stored_series:
+        result = empty_replay(
+            overview,
+            "正在通过多个公开行情源核验今日真实分钟数据；页面不会生成或预测缺失数值。",
+        )
         write_cache(cache_key, result)
         return result
 
-    candidates = overview["topIn"][:24] + overview["topOut"][:24]
-    series: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(fetch_intraday_for_board, board) for board in candidates]
-        for future in concurrent.futures.as_completed(futures):
-            item = future.result()
-            if item:
-                series.append(item)
-    positive_count = sum(1 for item in series if item["board"]["mainFlow"] > 0)
-    negative_count = sum(1 for item in series if item["board"]["mainFlow"] < 0)
-    if positive_count < 4 or negative_count < 4:
-        result = demo_replay(overview)
-        result["warning"] = "部分板块未提供分钟资金历史，回放采用明确标注的估算演示；收盘排名仍为真实数据。"
+    maximum_points = max((len(item.get("points") or {}) for item in stored_series), default=0)
+    minimum_points = max(2, math.ceil(maximum_points * 0.6))
+    complete_series = [
+        item for item in stored_series if len(item.get("points") or {}) >= minimum_points
+    ]
+    if not complete_series:
+        result = empty_replay(
+            overview,
+            "真实行情正在持续核验，达到稳定回放所需覆盖度后会自动显示。",
+        )
         write_cache(cache_key, result)
         return result
 
@@ -648,7 +778,7 @@ def build_replay(force: bool = False) -> dict[str, Any]:
     # Those same identities are carried through every frame, including sign
     # changes, so the visual can animate a real bubble instead of swapping ranks.
     tracked_series = sorted(
-        series,
+        complete_series,
         key=lambda item: max((abs(value) for value in item["points"].values()), default=0),
         reverse=True,
     )[:30]
@@ -662,24 +792,37 @@ def build_replay(force: bool = False) -> dict[str, Any]:
             continue
         values: list[dict[str, Any]] = []
         for item in tracked_series:
-            value = previous_point(item["points"], label)
+            value = item["points"].get(label)
             if value is not None:
                 values.append({**item["board"], "mainFlow": value})
-        if not values:
+        if len(values) < min(8, len(tracked_series)):
             continue
         positives = sorted((row for row in values if row["mainFlow"] >= 0), key=lambda row: row["mainFlow"], reverse=True)
         negatives = sorted((row for row in values if row["mainFlow"] < 0), key=lambda row: row["mainFlow"])
         frames.append({"time": label, "boards": values, "inflow": positives, "outflow": negatives})
     if not frames:
-        return demo_replay(overview)
+        result = empty_replay(
+            overview,
+            "真实分钟数据正在核验，当前不会以估算曲线代替。",
+        )
+        write_cache(cache_key, result)
+        return result
+    all_market_slots = elapsed_five_minute_times(
+        overview.get("updatedAt", ""),
+        trading_date,
+    )
+    coverage = round(len(frames) / max(len(all_market_slots), 1) * 100)
     result = {
-        "date": series[0].get("date") or today,
+        "date": trading_date,
         "updatedAt": now_cn().isoformat(timespec="seconds"),
-        "source": f"{overview['source']} + 东方财富分钟资金历史",
+        "source": replay_source_label(selected_source),
         "isDemo": False,
         "warning": "",
         "indexes": overview["indexes"],
-        "schemaVersion": 3,
+        "schemaVersion": 4,
+        "verifiedThrough": frames[-1]["time"],
+        "capturedSlots": len(frames),
+        "coveragePercent": min(100, coverage),
         "frames": frames,
     }
     write_cache(cache_key, result)
@@ -697,40 +840,20 @@ def rolling_mean(values: list[float], window: int) -> list[float | None]:
     return result
 
 
-def demo_history(code: str, name: str, current: float = 0.0) -> dict[str, Any]:
-    seed = int(hashlib.sha256(code.encode("utf-8")).hexdigest()[:8], 16)
-    rng = random.Random(seed)
-    dates: list[str] = []
-    cursor = now_cn().date() - dt.timedelta(days=92)
-    value = current * 0.4 or (rng.random() - 0.5) * 4_000_000_000
-    rows = []
-    while cursor <= now_cn().date():
-        if cursor.weekday() < 5:
-            value = value * 0.45 + (rng.random() - 0.5) * 8_000_000_000
-            dates.append(cursor.isoformat())
-            rows.append(value)
-        cursor += dt.timedelta(days=1)
-    ma5 = rolling_mean(rows, 5)
-    ma20 = rolling_mean(rows, 20)
-    return {
-        "code": code,
-        "name": name,
-        "source": "离线演示数据",
-        "isDemo": True,
-        "points": [
-            {"date": date, "mainFlow": value, "ma5": ma5[index], "ma20": ma20[index]}
-            for index, (date, value) in enumerate(zip(dates, rows))
-        ],
-    }
-
-
 def fetch_history(code: str, name: str) -> dict[str, Any]:
     cache_key = f"history-{code}"
     cached = read_cache(cache_key, max_age_seconds=6 * 3600)
-    if cached:
+    if cached and not cached.get("isDemo"):
         return cached
     if not code.startswith("BK"):
-        return demo_history(code, name)
+        raise DataSourceError("该备用来源板块暂未匹配到可核验的历史代码")
+    cutoff = now_cn().date() - dt.timedelta(days=95)
+    cutoff_label = cutoff.isoformat()
+    overview = read_cache("overview-latest") or {}
+    current_board = next(
+        (row for row in overview.get("boards", []) if row.get("code") == code),
+        {"code": code, "name": name, "category": "板块"},
+    )
     try:
         payload = fetch_json(
             "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
@@ -739,13 +862,14 @@ def fetch_history(code: str, name: str) -> dict[str, Any]:
                 "klt": 101,
                 "secid": f"90.{code}",
                 "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                "ut": EASTMONEY_UT,
             },
+            referer=f"https://data.eastmoney.com/bkzj/{code}.html",
         )
         data = payload.get("data") or {}
         rows = data.get("klines") or []
         parsed: list[tuple[str, float]] = []
-        cutoff = now_cn().date() - dt.timedelta(days=95)
         for line in rows:
             parts = str(line).split(",")
             if len(parts) < 2:
@@ -758,6 +882,13 @@ def fetch_history(code: str, name: str) -> dict[str, Any]:
                 parsed.append((parts[0], to_float(parts[1])))
         if len(parsed) < 5:
             raise DataSourceError("历史资金数据不足")
+        STORE.save_daily_points(
+            "eastmoney",
+            SOURCE_NAME,
+            current_board,
+            parsed,
+            now_cn().isoformat(timespec="seconds"),
+        )
         values = [item[1] for item in parsed]
         ma5 = rolling_mean(values, 5)
         ma20 = rolling_mean(values, 20)
@@ -773,13 +904,23 @@ def fetch_history(code: str, name: str) -> dict[str, Any]:
         }
         write_cache(cache_key, result)
         return result
-    except Exception:
-        current = 0.0
-        overview = read_cache("overview-latest") or {}
-        board = next((row for row in overview.get("boards", []) if row.get("code") == code), None)
-        if board:
-            current = to_float(board.get("mainFlow"))
-        return demo_history(code, name, current)
+    except Exception as exc:
+        stored_source, parsed = STORE.load_daily_points(code, cutoff_label)
+        if len(parsed) < 5:
+            raise DataSourceError(f"近三个月真实资金历史暂未通过核验：{exc}") from exc
+        values = [item[1] for item in parsed]
+        ma5 = rolling_mean(values, 5)
+        ma20 = rolling_mean(values, 20)
+        return {
+            "code": code,
+            "name": name,
+            "source": replay_source_label(stored_source),
+            "isDemo": False,
+            "points": [
+                {"date": item[0], "mainFlow": item[1], "ma5": ma5[index], "ma20": ma20[index]}
+                for index, item in enumerate(parsed)
+            ],
+        }
 
 
 def convert_video(raw: bytes, date_label: str) -> tuple[Path, str]:
@@ -821,6 +962,37 @@ def convert_video(raw: bytes, date_label: str) -> tuple[Path, str]:
     return output_path, filename
 
 
+def collect_replay(force: bool = False) -> dict[str, Any]:
+    with _REPLAY_LOCK:
+        return build_replay(force=force)
+
+
+def background_snapshot_collector(stop_event: threading.Event) -> None:
+    """Persist one real ranking snapshot for every completed market slot."""
+    last_attempt_key = ""
+    last_attempt_at = 0.0
+    if stop_event.wait(8):
+        return
+    while not stop_event.is_set():
+        current = now_cn()
+        slot = market_slot(current.isoformat(timespec="seconds"), current.date().isoformat())
+        attempt_key = f"{current.date().isoformat()}-{slot}"
+        should_attempt = (
+            current.weekday() < 5
+            and bool(slot)
+            and not STORE.has_capture(current.date().isoformat(), slot)
+            and (attempt_key != last_attempt_key or time.monotonic() - last_attempt_at >= 120)
+        )
+        if should_attempt:
+            last_attempt_key = attempt_key
+            last_attempt_at = time.monotonic()
+            try:
+                collect_overview(force=True)
+            except Exception as exc:
+                print(f"后台五分钟采集暂未完成：{exc}", flush=True)
+        stop_event.wait(20)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "FundFlowLocal/1.0"
 
@@ -855,9 +1027,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/health":
                 self.send_json(200, {"ok": True, "time": now_cn().isoformat(timespec="seconds")})
             elif parsed.path == "/api/overview":
-                self.send_json(200, build_overview(force=force))
+                self.send_json(200, collect_overview(force=force))
             elif parsed.path == "/api/replay":
-                self.send_json(200, build_replay(force=force))
+                self.send_json(200, collect_replay(force=force))
             elif parsed.path == "/api/history":
                 code = query.get("code", [""])[0]
                 name = query.get("name", [code])[0]
@@ -903,12 +1075,22 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    collector_stop = threading.Event()
+    collector_thread = threading.Thread(
+        target=background_snapshot_collector,
+        args=(collector_stop,),
+        name="fund-flow-snapshot-collector",
+        daemon=True,
+    )
+    collector_thread.start()
     print(f"资金流向本地数据服务：http://{HOST}:{PORT}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        collector_stop.set()
+        collector_thread.join(timeout=2)
         server.server_close()
 
 

@@ -18,6 +18,16 @@ function LoadingPanel() {
   );
 }
 
+function VerificationPanel() {
+  return (
+    <div className="loading-panel verification-panel" role="status">
+      <span className="loading-orbit" />
+      <strong>正在核验真实分时数据</strong>
+      <p>后台正在依次检查公开行情源并保存已确认的五分钟观测。</p>
+    </div>
+  );
+}
+
 function RankingList({ title, items, kind }: { title: string; items: OverviewData["topIn"]; kind: "in" | "out" }) {
   const maxValue = Math.max(...items.map((item) => Math.abs(item.mainFlow)), 1);
   return (
@@ -91,8 +101,8 @@ export default function Home() {
           <Link href="/trends">板块趋势</Link>
         </nav>
         <div className="top-actions">
-          <span className={`source-pill ${overview?.isDemo ? "demo" : ""}`}>
-            <i />{overview?.isDemo ? "演示数据" : "公开行情"}
+          <span className="source-pill">
+            <i />{replay?.verifiedThrough ? `真实分时至 ${replay.verifiedThrough}` : "公开行情核验中"}
           </span>
           <button className="refresh-button" type="button" onClick={() => load(true)} disabled={refreshing}>
             <span className={refreshing ? "spin" : ""}>↻</span>{refreshing ? "正在更新" : "更新收盘数据"}
@@ -167,11 +177,18 @@ export default function Home() {
                 <h2>今日资金流向回放</h2>
                 <p>每个气泡固定对应一个板块；金额越大气泡越大，净流入向上、净流出向下，过零时自动换边变色。</p>
               </div>
-              <div className="legend-pills"><span className="red">资金净流入</span><span className="green">资金净流出</span></div>
+              <div className="replay-status-group">
+                {replay?.verifiedThrough && (
+                  <span className="verified-status">
+                    已核验至 {replay.verifiedThrough} · {replay.coveragePercent ?? 0}%覆盖
+                  </span>
+                )}
+                <div className="legend-pills"><span className="red">资金净流入</span><span className="green">资金净流出</span></div>
+              </div>
             </div>
             {replay?.frames.length ? (
               <FlowBubbleCanvas date={replay.date} frames={replay.frames} indexes={replay.indexes} />
-            ) : <LoadingPanel />}
+            ) : <VerificationPanel />}
           </section>
 
           <section className="rankings-grid">
@@ -188,10 +205,10 @@ export default function Home() {
               </div>
               <Link className="text-link" href="/trends">查看三个月趋势 <span>→</span></Link>
             </div>
-            {replay?.frames.length ? <FlowLineChart frames={replay.frames} /> : <LoadingPanel />}
+            {replay?.frames.length ? <FlowLineChart frames={replay.frames} /> : <VerificationPanel />}
           </section>
 
-          {replay && <VideoGenerator replay={replay} />}
+          {replay?.frames.length ? <VideoGenerator replay={replay} /> : null}
         </>
       )}
 

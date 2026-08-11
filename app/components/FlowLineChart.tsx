@@ -21,8 +21,13 @@ export default function FlowLineChart({ frames }: Props) {
     candidates.slice(0, 5).map((item) => item.code),
   );
 
+  const activeSelection = useMemo(() => {
+    const available = selected.filter((code) => candidates.some((item) => item.code === code));
+    return available.length ? available.slice(0, 5) : candidates.slice(0, 5).map((item) => item.code);
+  }, [candidates, selected]);
+
   const series = useMemo(() => {
-    return selected.map((code, index) => {
+    return activeSelection.map((code, index) => {
       const fallbackName = candidates.find((item) => item.code === code)?.name || code;
       let lastValue = 0;
       const points = frames.map((frame) => {
@@ -32,7 +37,7 @@ export default function FlowLineChart({ frames }: Props) {
       });
       return { code, name: fallbackName, color: COLORS[index % COLORS.length], points };
     });
-  }, [candidates, frames, selected]);
+  }, [activeSelection, candidates, frames]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -120,7 +125,7 @@ export default function FlowLineChart({ frames }: Props) {
     <div className="flow-line-chart">
       <div className="chart-selector" aria-label="选择图表板块">
         {candidates.map((item) => {
-          const activeIndex = selected.indexOf(item.code);
+          const activeIndex = activeSelection.indexOf(item.code);
           return (
             <button
               type="button"

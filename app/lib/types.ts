@@ -45,6 +45,9 @@ export type ReplayData = {
   isDemo: boolean;
   warning: string;
   indexes: MarketIndex[];
+  verifiedThrough?: string;
+  capturedSlots?: number;
+  coveragePercent?: number;
   frames: ReplayFrame[];
 };
 
