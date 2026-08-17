@@ -13,6 +13,25 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
   const generate = async () => {
     if (!replay.frames.length || state === "recording" || state === "converting") return;
     try {
+      if (replay.verifiedThrough !== "15:00") {
+        throw new Error(`当前真实回放只核验至 ${replay.verifiedThrough || "--:--"}，收盘视频需等待 15:00 数据`);
+      }
+      const coveragePercent = replay.coveragePercent ?? 0;
+      if (coveragePercent < 100) {
+        throw new Error(`今日分钟回放覆盖率仅 ${coveragePercent}%，请先点击“更新收盘数据”补齐真实分时后再生成视频`);
+      }
+      setState("converting");
+      setProgress(0);
+      setMessage("正在检查本地视频服务和 FFmpeg…");
+      let capability: { ok?: boolean; message?: string };
+      try {
+        const preflight = await fetch(`${API_BASE}/api/video/capability`, { cache: "no-store" });
+        if (!preflight.ok) throw new Error(`本地视频服务返回 ${preflight.status}`);
+        capability = await preflight.json();
+      } catch {
+        throw new Error("本地视频服务未运行。请关闭残留网页，再用 start.command 或 start-windows.bat 重新打开应用");
+      }
+      if (!capability.ok) throw new Error(capability.message || "FFmpeg 当前不可用");
       const canvas = document.createElement("canvas");
       canvas.width = 720;
       canvas.height = 1280;
@@ -34,6 +53,8 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
         recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
       });
       const durationSeconds = 28;
+      const endingHoldSeconds = 3;
+      const motionSeconds = durationSeconds - endingHoldSeconds;
       const scaleMax = getReplayScaleMax(replay.frames);
       setState("recording");
       setProgress(0);
@@ -42,10 +63,13 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
       const startedAt = performance.now();
       await new Promise<void>((resolve) => {
         const render = (timestamp: number) => {
-          const elapsed = (timestamp - startedAt) / 1000;
+          // Some Windows/Edge builds use a slightly earlier origin for the
+          // first animation-frame timestamp. Never let that create frame -1.
+          const elapsed = Math.max(0, (timestamp - startedAt) / 1000);
           const ratio = Math.min(1, elapsed / durationSeconds);
-          const framePosition = ratio * Math.max(replay.frames.length - 1, 0);
-          const frameIndex = Math.min(replay.frames.length - 1, Math.floor(framePosition));
+          const motionRatio = Math.min(1, elapsed / motionSeconds);
+          const framePosition = motionRatio * Math.max(replay.frames.length - 1, 0);
+          const frameIndex = Math.max(0, Math.min(replay.frames.length - 1, Math.floor(framePosition)));
           drawFundFlowScene(context, {
             width: canvas.width,
             height: canvas.height,
@@ -65,6 +89,7 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
       recorder.stop();
       stream.getTracks().forEach((track) => track.stop());
       const webm = await stopped;
+      if (webm.size < 1024) throw new Error("浏览器没有录到有效画面，请保持页面在前台后重试");
       setState("converting");
       setMessage("正在转换为 MP4 并保存到本地…");
       setProgress(82);
@@ -78,6 +103,7 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
         throw new Error(payload.error || "MP4 转换失败");
       }
       const mp4 = await response.blob();
+      if (mp4.size < 1024) throw new Error("本地转换服务返回了空视频");
       setProgress(100);
       const url = URL.createObjectURL(mp4);
       const link = document.createElement("a");
@@ -88,7 +114,7 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
       link.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
       setState("done");
-      setMessage("MP4 已下载，并保存在项目 output 文件夹中");
+      setMessage(`MP4 已下载；结尾停留在 ${replay.verifiedThrough}，并保存在项目 output 文件夹中`);
     } catch (error) {
       setState("error");
       setMessage(error instanceof Error ? error.message : "视频生成失败");
@@ -110,7 +136,7 @@ export default function VideoGenerator({ replay }: { replay: ReplayData }) {
           </div>
         )}
         <button type="button" className="primary-button" onClick={generate} disabled={busy}>
-          {state === "recording" ? `正在生成 ${progress}%` : state === "converting" ? "正在转换 MP4" : "生成 28 秒 MP4"}
+          {state === "recording" ? `正在生成 ${progress}%` : state === "converting" ? (progress < 80 ? "正在检查视频服务" : "正在转换 MP4") : "生成 28 秒 MP4"}
         </button>
       </div>
     </div>

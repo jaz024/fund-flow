@@ -18,6 +18,16 @@ $officialRegistry = "https://registry.npmjs.org"
 
 Set-Location -LiteralPath $projectRoot
 
+# Store runtime data in the current Windows user's profile. This prevents a
+# database created by an Administrator launch from becoming read-only when the
+# same person starts the app normally on a later day.
+$localDataRoot = [Environment]::GetFolderPath("LocalApplicationData")
+if (-not [string]::IsNullOrWhiteSpace($localDataRoot)) {
+    $fundFlowDataRoot = Join-Path $localDataRoot "FundFlow"
+    New-Item -ItemType Directory -Path $fundFlowDataRoot -Force | Out-Null
+    $env:FUND_FLOW_DB_PATH = Join-Path $fundFlowDataRoot "fund-flow.sqlite3"
+}
+
 try {
     Start-Transcript -LiteralPath $startupLog -Append | Out-Null
     $transcriptStarted = $true
@@ -32,6 +42,27 @@ function Test-LocalUrl {
     try {
         $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
         return $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-CurrentApi {
+    try {
+        $health = Invoke-RestMethod -Uri $apiHealthUrl -TimeoutSec 3
+        return $health.app -eq "fund-flow" -and [int]$health.apiVersion -eq 5
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-CurrentWeb {
+    param([Parameter(Mandatory = $true)][string]$Url)
+    try {
+        $response = Invoke-WebRequest -Uri "${Url}/strategy" -UseBasicParsing -TimeoutSec 5
+        return $response.StatusCode -eq 200 -and $response.Content.Contains('data-fund-flow-version="5"')
     }
     catch {
         return $false
@@ -213,7 +244,30 @@ try {
         Write-Host "Note: FFmpeg was not found. Market data will work, but MP4 generation requires FFmpeg." -ForegroundColor DarkYellow
     }
 
-    if (Test-LocalUrl -Url $apiHealthUrl) {
+    if ((Test-LocalUrl -Url $webUrl) -and -not (Test-LocalUrl -Url $apiHealthUrl)) {
+        $webListener = Get-NetTCPConnection -LocalPort $webPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        $orphanedWeb = if ($null -ne $webListener) { Get-CimInstance Win32_Process -Filter "ProcessId = $($webListener.OwningProcess)" -ErrorAction SilentlyContinue } else { $null }
+        if ($null -ne $orphanedWeb -and $orphanedWeb.CommandLine -like "*vinext*") {
+            Write-Host "A website from the previous run is still open without its data service. Restarting it safely..." -ForegroundColor Yellow
+            Stop-Process -Id $webListener.OwningProcess -Force
+            Start-Sleep -Seconds 1
+        }
+    }
+
+    if ((Test-LocalUrl -Url $apiHealthUrl) -and -not (Test-CurrentApi)) {
+        $listener = Get-NetTCPConnection -LocalPort $apiPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        $staleProcess = if ($null -ne $listener) { Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue } else { $null }
+        if ($null -ne $staleProcess -and $staleProcess.CommandLine -like "*local_server.py*") {
+            Write-Host "An older Fund Flow data service was found. Restarting it safely..." -ForegroundColor Yellow
+            Stop-Process -Id $listener.OwningProcess -Force
+            Start-Sleep -Seconds 1
+        }
+        else {
+            throw "Port ${apiPort} is occupied by an incompatible service. Close older Fund Flow terminal windows and try again."
+        }
+    }
+
+    if (Test-CurrentApi) {
         Write-Host "The data service is already running and will be reused."
     }
     else {
@@ -231,7 +285,19 @@ try {
         }
     }
 
-    if (Test-LocalUrl -Url $webUrl) {
+    if ((Test-LocalUrl -Url $webUrl) -and -not (Test-CurrentWeb -Url $webUrl)) {
+        foreach ($candidatePort in 3001..3010) {
+            $candidateUrl = "http://${webAddress}:${candidatePort}"
+            if (-not (Test-LocalUrl -Url $candidateUrl)) {
+                $webPort = $candidatePort
+                $webUrl = $candidateUrl
+                Write-Host "Port 3000 contains an older website; this launch will use ${webUrl}." -ForegroundColor Yellow
+                break
+            }
+        }
+    }
+
+    if (Test-CurrentWeb -Url $webUrl) {
         Write-Host "The website is already running. Opening ${webUrl}" -ForegroundColor Green
         Start-Process $webUrl
 
@@ -254,6 +320,10 @@ try {
 
     if (-not (Wait-ForLocalUrl -Url $webUrl -TimeoutSeconds 90 -StartedProcess $webProcess)) {
         throw "The website did not start within 90 seconds. Read the message above and try again."
+    }
+
+    if (-not (Test-CurrentWeb -Url $webUrl)) {
+        throw "The web server started, but the current stock routes are missing. Reinstall the web packages and try again."
     }
 
     Write-Host "The website is ready. Opening ${webUrl}" -ForegroundColor Green

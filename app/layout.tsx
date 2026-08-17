@@ -2,14 +2,14 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "资金脉络｜A股板块资金流向",
-  description: "沪深京A股行业与概念板块资金净流五分钟回放、排名及三个月趋势。",
+  title: "资金脉络｜A股板块、个股异动与策略实验室",
+  description: "沪深京A股板块资金流回放、个股分钟异动、排名、趋势及本地观察性策略模拟。",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body data-fund-flow-version="5">{children}</body>
     </html>
   );
 }

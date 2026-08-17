@@ -63,7 +63,7 @@ export default function TrendsPage() {
           <span className="brand-mark"><i /><i /><i /></span>
           <span><strong>资金脉络</strong><small>A股板块观察台</small></span>
         </Link>
-        <nav aria-label="主导航"><Link href="/">今日总览</Link><Link className="active" href="/trends">板块趋势</Link></nav>
+        <nav aria-label="主导航"><Link href="/">今日总览</Link><Link className="active" href="/trends">板块趋势</Link><Link href="/stocks">个股异动</Link><Link href="/strategy">策略模拟</Link></nav>
         <Link className="back-link" href="/">← 返回今日总览</Link>
       </header>
 

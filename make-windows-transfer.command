@@ -36,7 +36,15 @@ mkdir -p "$staging_app"
   --exclude='fund-flow-windows-transfer-*.zip' \
   "${project_root}/" "${staging_app}/"
 
-/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$staging_app" "$output_zip"
+# A plain Zip64 archive avoids macOS resource-fork folders such as __MACOSX,
+# which are harmless but confusing when the package is opened on Windows.
+if [[ -e "$output_zip" ]]; then
+  /bin/rm -f -- "$output_zip"
+fi
+(
+  cd "$staging_root"
+  /usr/bin/zip -q -r -X "$output_zip" "$(basename "$staging_app")"
+)
 
 echo
 echo "Windows transfer ZIP created:"

@@ -99,6 +99,8 @@ export default function Home() {
         <nav aria-label="主导航">
           <Link className="active" href="/">今日总览</Link>
           <Link href="/trends">板块趋势</Link>
+          <Link href="/stocks">个股异动</Link>
+          <Link href="/strategy">策略模拟</Link>
         </nav>
         <div className="top-actions">
           <span className="source-pill">

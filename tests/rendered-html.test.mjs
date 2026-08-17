@@ -29,3 +29,27 @@ test("renders the sector trend route", async () => {
   assert.match(html, /板块资金/);
   assert.match(html, /今日资金净额前 80/);
 });
+
+test("renders the stock anomaly route", async () => {
+  const response = await render("/stocks");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /一分钟异动/);
+  assert.match(html, /正在核验个股分钟行情/);
+});
+
+test("renders a dynamic stock detail route", async () => {
+  const response = await render("/stocks/000001?market=0&name=%E5%B9%B3%E5%AE%89%E9%93%B6%E8%A1%8C");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /返回个股异动/);
+});
+
+test("renders the no-code strategy laboratory", async () => {
+  const response = await render("/strategy");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /不写代码/);
+  assert.match(html, /只看当时数据/);
+  assert.match(html, /策略实验室/);
+});
