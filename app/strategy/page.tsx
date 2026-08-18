@@ -11,8 +11,8 @@ export default function StrategyPage() {
       </header>
 
       <section className="strategy-page-hero">
-        <div><span className="date-kicker">STRATEGY LAB · NO REAL ORDERS</span><h1>不写代码，也能验证<em>自己的规则。</em></h1><p>选择买入信号、行业过滤、成交方式、仓位和退出条件；先回放今日真实数据，再决定是否让本地模拟账户持续运行。</p></div>
-        <div className="strategy-hero-principles"><span>POINT-IN-TIME</span><strong>只看当时数据</strong><small>策略版本化 · T+1 · 按交易所申报单位 · 成本与滑点</small></div>
+        <div><span className="date-kicker">QUANT STRATEGY LAB · NO REAL ORDERS</span><h1>把一个想法，拆成<em>可验证的策略。</em></h1><p>从趋势、均值回归、波动突破或原追涨模板开始，再组合信号、成交、仓位与退出规则。没有足够真实数据的模型不会生成结果。</p></div>
+        <div className="strategy-hero-principles"><span>POINT-IN-TIME</span><strong>模型可以逆势买入</strong><small>信号与执行分离 · T+1 · 版本化 · 成本与滑点</small></div>
       </section>
 
       <StrategyLab />

@@ -45,11 +45,11 @@ test("renders a dynamic stock detail route", async () => {
   assert.match(html, /返回个股异动/);
 });
 
-test("renders the no-code strategy laboratory", async () => {
+test("renders the composable quantitative strategy laboratory", async () => {
   const response = await render("/strategy");
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /不写代码/);
-  assert.match(html, /只看当时数据/);
+  assert.match(html, /可验证的策略/);
+  assert.match(html, /模型可以逆势买入/);
   assert.match(html, /策略实验室/);
 });

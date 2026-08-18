@@ -62,7 +62,7 @@ function Test-CurrentWeb {
     param([Parameter(Mandatory = $true)][string]$Url)
     try {
         $response = Invoke-WebRequest -Uri "${Url}/strategy" -UseBasicParsing -TimeoutSec 5
-        return $response.StatusCode -eq 200 -and $response.Content.Contains('data-fund-flow-version="5"')
+        return $response.StatusCode -eq 200 -and $response.Content.Contains('data-fund-flow-version="8"')
     }
     catch {
         return $false

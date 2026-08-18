@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime as dt
+import hashlib
 import html
 import json
 import math
@@ -44,7 +45,7 @@ EASTMONEY_MINUTE_SOURCE = "东方财富真实分钟资金（延时）"
 STOCK_SOURCE_NAME = "东方财富公开个股行情（延时）"
 SINA_STOCK_SOURCE = "新浪财经公开个股行情"
 TENCENT_STOCK_SOURCE = "腾讯证券公开个股行情"
-API_VERSION = 5
+API_VERSION = 8
 THS_SOURCE_NAME = "同花顺公开网页"
 EASTMONEY_UT = "b2884a393a59ad64002292a3e90d46a5"
 EASTMONEY_CHANGE_UT = "7eea3edcaed734bea9cbfc24409ed989"
@@ -1005,8 +1006,12 @@ STRATEGY_STAMP_DUTY_RATE = 0.0005
 STRATEGY_SLIPPAGE_RATE = 0.0005
 STRATEGY_LAB_DEFAULT_CONFIG: dict[str, Any] = {
     "name": "板块确认追涨",
+    "signalModel": "rapid_rise",
     "marketScope": "all",
     "oneMinuteRise": 0.8,
+    "lookbackMinutes": 1,
+    "vwapFilter": "any",
+    "minVolumeRatio": 0.0,
     "sectorFilter": "both",
     "minAmount": 50_000_000,
     "minScore": 55.0,
@@ -1022,6 +1027,65 @@ STRATEGY_LAB_DEFAULT_CONFIG: dict[str, Any] = {
     "stopLossPct": 1.5,
     "initialCapital": 100_000.0,
 }
+
+STRATEGY_LAB_PRESETS: list[dict[str, Any]] = [
+    {
+        "id": "rapid_rise",
+        "name": "板块确认追涨",
+        "description": "一分钟快速上涨，且行业上涨并有资金净流入；保留原观察策略作为一个模板。",
+        "dataStatus": "ready",
+        "config": {**STRATEGY_LAB_DEFAULT_CONFIG},
+    },
+    {
+        "id": "trend",
+        "name": "短线趋势延续",
+        "description": "价格在近十分钟保持正向趋势、位于分钟均价上方，并由成交量确认。",
+        "dataStatus": "ready",
+        "config": {
+            **STRATEGY_LAB_DEFAULT_CONFIG,
+            "name": "短线趋势延续", "signalModel": "trend", "oneMinuteRise": 1.0,
+            "lookbackMinutes": 10, "vwapFilter": "above", "minVolumeRatio": 1.2,
+            "sectorFilter": "rise", "minAmount": 100_000_000, "minScore": 45.0,
+            "endTime": "14:40", "exitMode": "model_reverse",
+            "takeProfitPct": 4.0, "stopLossPct": 2.0,
+        },
+    },
+    {
+        "id": "mean_reversion",
+        "name": "超跌均值回归",
+        "description": "股票快速下跌且偏离分钟均价，在放量条件下等待价格向均值修复；不是追涨。",
+        "dataStatus": "ready",
+        "config": {
+            **STRATEGY_LAB_DEFAULT_CONFIG,
+            "name": "超跌均值回归", "signalModel": "mean_reversion", "oneMinuteRise": 1.0,
+            "lookbackMinutes": 5, "vwapFilter": "below", "minVolumeRatio": 1.25,
+            "sectorFilter": "none", "minAmount": 80_000_000, "minScore": 40.0,
+            "endTime": "14:40", "exitMode": "model_reverse",
+            "takeProfitPct": 3.0, "stopLossPct": 2.0,
+        },
+    },
+    {
+        "id": "volatility_breakout",
+        "name": "放量波动突破",
+        "description": "最新价格突破此前区间高点，并要求成交量和 VWAP 同时确认。",
+        "dataStatus": "ready",
+        "config": {
+            **STRATEGY_LAB_DEFAULT_CONFIG,
+            "name": "放量波动突破", "signalModel": "volatility_breakout", "oneMinuteRise": 0.25,
+            "lookbackMinutes": 15, "vwapFilter": "above", "minVolumeRatio": 1.5,
+            "sectorFilter": "rise", "minAmount": 100_000_000, "minScore": 45.0,
+            "endTime": "14:40", "exitMode": "model_reverse",
+            "takeProfitPct": 4.0, "stopLossPct": 2.0,
+        },
+    },
+]
+
+STRATEGY_LAB_FUTURE_MODELS: list[dict[str, str]] = [
+    {"id": "multi_factor", "name": "多因子 / 估值", "requirement": "需要逐日保存的历史时点财务与估值数据"},
+    {"id": "pairs", "name": "配对交易 / 统计套利", "requirement": "需要更长的同步个股历史样本及协整检验"},
+    {"id": "ml", "name": "机器学习 / 状态模型", "requirement": "需要训练集、样本外验证、模型版本和漂移监控"},
+    {"id": "order_flow", "name": "订单流 / 做市", "requirement": "需要 Level-2 逐笔委托与成交数据"},
+]
 
 
 def is_allowed_stock(code: str, name: str) -> bool:
@@ -2074,8 +2138,12 @@ def validate_strategy_lab_config(raw: Any) -> dict[str, Any]:
 
     result = {
         "name": str(config.get("name") or "我的策略").strip()[:36] or "我的策略",
+        "signalModel": choice("signalModel", {"rapid_rise", "trend", "mean_reversion", "volatility_breakout"}),
         "marketScope": choice("marketScope", {"all", "sh", "sz", "bj"}),
         "oneMinuteRise": round(bounded("oneMinuteRise", 0.1, 10.0), 2),
+        "lookbackMinutes": int(round(bounded("lookbackMinutes", 1, 60))),
+        "vwapFilter": choice("vwapFilter", {"any", "above", "below"}),
+        "minVolumeRatio": round(bounded("minVolumeRatio", 0, 10), 2),
         "sectorFilter": choice("sectorFilter", {"both", "flow", "rise", "none"}),
         "minAmount": round(bounded("minAmount", 0, 5_000_000_000), 2),
         "minScore": round(bounded("minScore", 0, 100), 1),
@@ -2086,7 +2154,7 @@ def validate_strategy_lab_config(raw: Any) -> dict[str, Any]:
         "allocationMode": choice("allocationMode", {"fixed_pct", "equal_slots"}),
         "positionPct": round(bounded("positionPct", 1, 50), 1),
         "maxPositions": int(round(bounded("maxPositions", 1, 50))),
-        "exitMode": choice("exitMode", {"next_open", "next_0931", "risk_close", "hold"}),
+        "exitMode": choice("exitMode", {"next_open", "next_0931", "risk_close", "model_reverse", "hold"}),
         "takeProfitPct": round(bounded("takeProfitPct", 0, 30), 2),
         "stopLossPct": round(bounded("stopLossPct", 0, 20), 2),
         "initialCapital": round(bounded("initialCapital", 10_000, 100_000_000), 2),
@@ -2114,10 +2182,19 @@ def strategy_lab_summary(config: dict[str, Any]) -> str:
         "next_open": "次一交易日开盘卖出",
         "next_0931": "次一交易日09:31卖出",
         "risk_close": f"次一交易日起止盈{config['takeProfitPct']:.1f}%、止损{config['stopLossPct']:.1f}%，否则收盘卖出",
+        "model_reverse": f"T+1可卖后由反向模型退出，并同时执行止盈{config['takeProfitPct']:.1f}%、止损{config['stopLossPct']:.1f}%",
         "hold": "持续持有，不自动卖出",
     }[config["exitMode"]]
+    model_text = {
+        "rapid_rise": f"一分钟上涨达到 {config['oneMinuteRise']:.2f}%",
+        "trend": f"近 {config['lookbackMinutes']} 分钟上涨达到 {config['oneMinuteRise']:.2f}%",
+        "mean_reversion": f"近 {config['lookbackMinutes']} 分钟下跌达到 {config['oneMinuteRise']:.2f}%",
+        "volatility_breakout": f"突破此前 {config['lookbackMinutes']} 分钟高点 {config['oneMinuteRise']:.2f}%",
+    }[config["signalModel"]]
+    vwap_text = {"any": "不限制VWAP", "above": "价格在VWAP上方", "below": "价格在VWAP下方"}[config["vwapFilter"]]
+    volume_text = "不限制分钟量比" if config["minVolumeRatio"] <= 0 else f"分钟量比至少 {config['minVolumeRatio']:.2f}"
     return (
-        f"{scope}中，一分钟涨幅达到 {config['oneMinuteRise']:.2f}%、{sector}、"
+        f"{scope}中，{model_text}、{vwap_text}、{volume_text}、{sector}、"
         f"累计成交额不少于 {config['minAmount'] / 100_000_000:.2f}亿元且评分达到 {config['minScore']:.1f} 时，"
         f"延迟 {config['buyDelayMinutes']} 分钟按{price}模拟买入；{allocation}，最多 {config['maxPositions']} 只；{exit_text}。"
     )
@@ -2133,6 +2210,155 @@ def strategy_lab_market_matches(code: str, market: int, scope: str) -> bool:
     return market == 0 and not code.startswith(("4", "8", "92"))
 
 
+def strategy_lab_raw_candidates(
+    config: dict[str, Any],
+    market: dict[str, Any],
+    *,
+    after_time: str = "",
+) -> list[dict[str, Any]]:
+    """Return an event-time candidate universe without using later prices.
+
+    The legacy rapid-rise model keeps using its audit table. Other technical
+    models use the full two-sided public anomaly feed so a falling stock can be
+    considered by mean reversion. Prices are evaluated separately and only up
+    to each event minute.
+    """
+    trading_date = str(market.get("date") or "")
+    verified = str(market.get("verifiedThrough") or "")
+    model = str(config.get("signalModel") or "rapid_rise")
+    if model == "rapid_rise":
+        return [
+            row for row in STORE.load_strategy_signals_for_date(trading_date)
+            if after_time < str(row.get("signal_time") or "") <= verified
+        ]
+
+    direction = -1 if model == "mean_reversion" else 1
+    allowed_types = {8203, 8204} if direction < 0 else {8201, 8202}
+    rows: list[dict[str, Any]] = []
+    for event in market.get("events") or []:
+        signal_time = str(event.get("time") or "")
+        code = str(event.get("code") or "")
+        if (
+            int(event.get("direction") or 0) != direction
+            or int(event.get("eventType") or 0) not in allowed_types
+            or not (after_time < signal_time <= verified)
+            or not is_allowed_stock(code, str(event.get("name") or ""))
+        ):
+            continue
+        rows.append({
+            "trading_date": trading_date,
+            "stock_code": code,
+            "market": infer_stock_market(code, event.get("market")),
+            "stock_name": str(event.get("name") or code),
+            "signal_time": signal_time,
+            "event_type": int(event.get("eventType") or 0),
+            "event_label": str(event.get("event") or "公开异动"),
+            "event_direction": direction,
+            "event_severity": to_float(event.get("severity")),
+            "industry_code": "", "industry_name": "",
+            "sector_change_pct": 0.0, "sector_main_flow": 0.0,
+            "liquidity_amount": 0.0, "strategy_score": 0.0,
+        })
+    return sorted(rows, key=lambda row: (str(row["signal_time"]), -to_float(row.get("event_severity"))))
+
+
+def strategy_lab_analyze_candidate(
+    row: dict[str, Any],
+    trend: dict[str, Any],
+    config: dict[str, Any],
+    trading_date: str,
+    verified: str,
+) -> dict[str, Any] | None:
+    """Calculate causal price features for one candidate at its signal time."""
+    signal_time = str(row.get("signal_time") or "")
+    points = [
+        point for point in trend.get("points") or []
+        if str(point.get("date") or trading_date) == trading_date
+        and str(point.get("time") or "") <= min(signal_time, verified)
+    ]
+    if len(points) < 2:
+        return None
+    signal = points[-1]
+    previous = points[-2]
+    signal_price = to_float(signal.get("price"))
+    previous_price = to_float(previous.get("price"))
+    if signal_price <= 0 or previous_price <= 0:
+        return None
+
+    lookback_minutes = int(config.get("lookbackMinutes") or 1)
+    target_minute = minute_number(signal_time) - lookback_minutes
+    lookback = next(
+        (point for point in points if minute_number(str(point.get("time") or "")) >= target_minute),
+        points[0],
+    )
+    lookback_price = to_float(lookback.get("price"))
+    one_minute_return = (signal_price / previous_price - 1) * 100
+    lookback_return = (signal_price / lookback_price - 1) * 100 if lookback_price > 0 else 0.0
+    prior_window = [point for point in points[:-1] if minute_number(str(point.get("time") or "")) >= target_minute]
+    prior_high = max((to_float(point.get("high"), to_float(point.get("price"))) for point in prior_window), default=0.0)
+    breakout_return = (signal_price / prior_high - 1) * 100 if prior_high > 0 else 0.0
+    vwap = to_float(signal.get("average"))
+    vwap_distance = (signal_price / vwap - 1) * 100 if vwap > 0 else 0.0
+    current_volume = max(0.0, to_float(signal.get("volume")))
+    prior_volumes = [max(0.0, to_float(point.get("volume"))) for point in prior_window[-10:] if to_float(point.get("volume")) > 0]
+    normal_volume = statistics.fmean(prior_volumes) if prior_volumes else 0.0
+    volume_ratio = current_volume / normal_volume if normal_volume > 0 else 0.0
+    amount = sum(max(0.0, to_float(point.get("amount"))) for point in points)
+    model = str(config.get("signalModel") or "rapid_rise")
+    model_return = {
+        "rapid_rise": one_minute_return,
+        "trend": lookback_return,
+        "mean_reversion": lookback_return,
+        "volatility_breakout": breakout_return,
+    }[model]
+    threshold = max(0.1, to_float(config.get("oneMinuteRise"), 0.8))
+    magnitude_score = min(70.0, abs(model_return) / threshold * 45.0)
+    volume_score = min(20.0, volume_ratio * 8.0)
+    vwap_score = min(10.0, abs(vwap_distance) * 4.0)
+    technical_score = min(100.0, magnitude_score + volume_score + vwap_score)
+    analyzed = {
+        **row,
+        "one_minute_return": one_minute_return,
+        "model_return": model_return,
+        "lookback_return": lookback_return,
+        "breakout_return": breakout_return,
+        "signal_price": signal_price,
+        "vwap": vwap,
+        "vwap_distance": vwap_distance,
+        "volume_ratio": volume_ratio,
+        "liquidity_amount": amount,
+        "strategy_score": to_float(row.get("strategy_score")) if model == "rapid_rise" else technical_score,
+        "model_label": {
+            "rapid_rise": "一分钟快速上涨",
+            "trend": f"{lookback_minutes}分钟趋势延续",
+            "mean_reversion": f"{lookback_minutes}分钟超跌偏离",
+            "volatility_breakout": f"突破{lookback_minutes}分钟区间高点",
+        }[model],
+    }
+    return analyzed
+
+
+def strategy_lab_attach_sector(row: dict[str, Any], trading_date: str) -> dict[str, Any]:
+    """Attach a point-in-time sector observation when a strategy asks for it."""
+    if str(row.get("industry_name") or ""):
+        return row
+    code = str(row.get("stock_code") or "")
+    market = infer_stock_market(code, row.get("market"))
+    try:
+        industry = stock_primary_industry(code, market)
+        snapshot = STORE.load_sector_snapshot_at(trading_date, str(row.get("signal_time") or ""))
+        sector = resolve_signal_industry(industry["name"], snapshot)
+        return {
+            **row,
+            "industry_name": str((sector or {}).get("name") or (sector or {}).get("board_name") or industry["name"]),
+            "industry_code": str((sector or {}).get("code") or (sector or {}).get("board_code") or ""),
+            "sector_change_pct": to_float((sector or {}).get("changePct"), to_float((sector or {}).get("change_pct"))),
+            "sector_main_flow": to_float((sector or {}).get("mainFlow"), to_float((sector or {}).get("main_flow"))),
+        }
+    except Exception:
+        return row
+
+
 def strategy_lab_signal_matches(row: dict[str, Any], config: dict[str, Any], verified: str) -> bool:
     signal_time = str(row.get("signal_time") or "")
     if not (config["startTime"] <= signal_time <= min(config["endTime"], verified)):
@@ -2141,7 +2367,21 @@ def strategy_lab_signal_matches(row: dict[str, Any], config: dict[str, Any], ver
     market = int(row.get("market") or infer_stock_market(code))
     if not strategy_lab_market_matches(code, market, config["marketScope"]):
         return False
-    if to_float(row.get("one_minute_return")) < config["oneMinuteRise"]:
+    model = str(config.get("signalModel") or "rapid_rise")
+    model_return = to_float(row.get("model_return"), to_float(row.get("one_minute_return")))
+    threshold = to_float(config.get("oneMinuteRise"))
+    if model == "mean_reversion":
+        if model_return > -threshold:
+            return False
+    elif model_return < threshold:
+        return False
+    vwap_filter = str(config.get("vwapFilter") or "any")
+    vwap_distance = to_float(row.get("vwap_distance"))
+    if vwap_filter == "above" and vwap_distance <= 0:
+        return False
+    if vwap_filter == "below" and vwap_distance >= 0:
+        return False
+    if to_float(row.get("volume_ratio")) < to_float(config.get("minVolumeRatio")):
         return False
     if to_float(row.get("liquidity_amount")) < config["minAmount"]:
         return False
@@ -2155,6 +2395,54 @@ def strategy_lab_signal_matches(row: dict[str, Any], config: dict[str, Any], ver
         "rise": sector_rise,
         "none": True,
     }[config["sectorFilter"]]
+
+
+def prepare_strategy_lab_candidates(
+    config: dict[str, Any],
+    market: dict[str, Any],
+    *,
+    after_time: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any] | Exception]]:
+    """Build all matching rows using only features available at each event."""
+    trading_date = str(market.get("date") or "")
+    verified = str(market.get("verifiedThrough") or "")
+    raw_rows = [
+        row for row in strategy_lab_raw_candidates(config, market, after_time=after_time)
+        if config["startTime"] <= str(row.get("signal_time") or "") <= min(config["endTime"], verified)
+        and strategy_lab_market_matches(
+            str(row.get("stock_code") or ""),
+            infer_stock_market(str(row.get("stock_code") or ""), row.get("market")),
+            str(config["marketScope"]),
+        )
+    ]
+    trends = strategy_lab_prefetch_trends(raw_rows)
+    matched: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    for row in raw_rows:
+        code = str(row.get("stock_code") or "")
+        if code in seen_codes:
+            continue
+        trend = trends.get(code)
+        if not isinstance(trend, dict):
+            continue
+        if str(config.get("signalModel")) == "rapid_rise":
+            analyzed = {
+                **row,
+                "model_return": to_float(row.get("one_minute_return")),
+                "model_label": str(row.get("event_label") or "一分钟快速上涨"),
+                "volume_ratio": to_float(row.get("volume_ratio")),
+                "vwap_distance": to_float(row.get("vwap_distance")),
+            }
+        else:
+            analyzed = strategy_lab_analyze_candidate(row, trend, config, trading_date, verified)
+        if not analyzed:
+            continue
+        if str(config.get("sectorFilter")) != "none":
+            analyzed = strategy_lab_attach_sector(analyzed, trading_date)
+        if strategy_lab_signal_matches(analyzed, config, verified):
+            matched.append(analyzed)
+            seen_codes.add(code)
+    return matched, trends
 
 
 def strategy_lab_execution_point(
@@ -2199,17 +2487,121 @@ def strategy_lab_prefetch_trends(rows: list[dict[str, Any]]) -> dict[str, dict[s
     return results
 
 
+def strategy_lab_preview_cache_name(config: dict[str, Any], trading_date: str) -> str:
+    """Return a stable per-day cache key for one complete strategy definition."""
+    encoded = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fingerprint = hashlib.sha256(encoded).hexdigest()[:20]
+    return f"strategy-lab-preview-{trading_date}-{fingerprint}"
+
+
+def normalize_strategy_lab_preview(preview: dict[str, Any]) -> dict[str, Any]:
+    """Expose one stable trade schema while retaining older replay aliases."""
+    normalized = dict(preview)
+    trading_date = str(normalized.get("date") or "")
+    trades: list[dict[str, Any]] = []
+    for item in normalized.get("trades") or []:
+        if not isinstance(item, dict):
+            continue
+        trade = dict(item)
+        if trade.get("entryTime") in (None, "") and trade.get("executionTime") not in (None, ""):
+            trade["entryTime"] = trade["executionTime"]
+        if trade.get("executionTime") in (None, "") and trade.get("entryTime") not in (None, ""):
+            trade["executionTime"] = trade["entryTime"]
+        if trade.get("entryPrice") is None and trade.get("executionPrice") is not None:
+            trade["entryPrice"] = trade["executionPrice"]
+        if trade.get("executionPrice") is None and trade.get("entryPrice") is not None:
+            trade["executionPrice"] = trade["entryPrice"]
+        if trade.get("entryDate") in (None, "") and trading_date:
+            trade["entryDate"] = trading_date
+        trades.append(trade)
+    normalized["trades"] = trades
+    return normalized
+
+
+def save_strategy_lab_preview(config: dict[str, Any], preview: dict[str, Any]) -> None:
+    trading_date = str(preview.get("date") or "")
+    if not trading_date or not preview.get("equity"):
+        return
+    normalized = normalize_strategy_lab_preview(preview)
+    payload = {
+        "config": config,
+        "savedAt": now_cn().isoformat(timespec="seconds"),
+        "preview": {**normalized, "isStale": False},
+    }
+    write_cache(strategy_lab_preview_cache_name(config, trading_date), payload)
+
+
+def load_strategy_lab_preview(
+    config: dict[str, Any],
+    market: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Restore the latest successful replay so reopening the page keeps its graph."""
+    trading_date = str(market.get("date") or "")
+    current_verified = str(market.get("verifiedThrough") or "")
+    payload = read_cache(strategy_lab_preview_cache_name(config, trading_date))
+    if not isinstance(payload, dict) or payload.get("config") != config:
+        return None
+    preview = payload.get("preview")
+    if not isinstance(preview, dict) or str(preview.get("date") or "") != trading_date:
+        return None
+    cached_verified = str(preview.get("verifiedThrough") or "")
+    if not cached_verified or cached_verified > current_verified or not preview.get("equity"):
+        return None
+    restored = normalize_strategy_lab_preview(preview)
+    restored["isStale"] = cached_verified != current_verified
+    if restored["isStale"]:
+        restored["notice"] = (
+            f"正在显示上次成功回放（核验至 {cached_verified}）；点击“更新今日回放”可核验至最新时间。"
+        )
+    return restored
+
+
+def load_strategy_lab_preview_history(limit: int = 90) -> list[dict[str, Any]]:
+    """Return saved, reproducible daily replays for the local history browser."""
+    records: list[dict[str, Any]] = []
+    try:
+        paths = list(CACHE_DIR.glob("strategy-lab-preview-*.json"))
+    except OSError:
+        return records
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        preview = payload.get("preview")
+        if not isinstance(preview, dict) or not preview.get("date") or not preview.get("equity"):
+            continue
+        config = validate_strategy_lab_config(payload.get("config"))
+        date_label = str(preview.get("date") or "")
+        verified = str(preview.get("verifiedThrough") or "")
+        normalized_preview = normalize_strategy_lab_preview(preview)
+        records.append({
+            "id": path.stem.removeprefix("strategy-lab-preview-"),
+            "savedAt": str(payload.get("savedAt") or dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")),
+            "date": date_label,
+            "verifiedThrough": verified,
+            "sessionStatus": "closed" if verified >= "15:00" else "intraday",
+            "strategyName": str(config.get("name") or "已保存策略"),
+            "strategySummary": strategy_lab_summary(config),
+            "config": config,
+            "preview": {**normalized_preview, "isStale": False},
+        })
+    return sorted(
+        records,
+        key=lambda item: (str(item["date"]), str(item["verifiedThrough"]), str(item["savedAt"])),
+        reverse=True,
+    )[: max(1, limit)]
+
+
 def build_strategy_lab_preview(
     config: dict[str, Any],
     market: dict[str, Any],
 ) -> dict[str, Any]:
     trading_date = str(market["date"])
     verified = str(market["verifiedThrough"])
-    rows = [
-        row for row in STORE.load_strategy_signals_for_date(trading_date)
-        if strategy_lab_signal_matches(row, config, verified)
-    ]
-    trends = strategy_lab_prefetch_trends(rows)
+    rows, trends = prepare_strategy_lab_candidates(config, market)
     initial_cash = float(config["initialCapital"])
     cash = initial_cash
     trades: list[dict[str, Any]] = []
@@ -2267,13 +2659,17 @@ def build_strategy_lab_preview(
             "sectorChangePct": to_float(row.get("sector_change_pct")),
             "sectorMainFlow": to_float(row.get("sector_main_flow")),
             "oneMinuteReturn": to_float(row.get("one_minute_return")),
+            "modelReturn": to_float(row.get("model_return"), to_float(row.get("one_minute_return"))),
+            "modelLabel": str(row.get("model_label") or row.get("event_label") or "策略信号"),
+            "volumeRatio": to_float(row.get("volume_ratio")),
+            "vwapDistance": to_float(row.get("vwap_distance")),
             "score": to_float(row.get("strategy_score")), "status": "open",
         }
         trades.append({**trade, "_points": points})
         events.append({
             "date": trading_date, "time": str(execution["time"]), "type": "buy",
             "code": code, "name": str(row["stock_name"]), "title": f"买入 {row['stock_name']}",
-            "detail": f"{row['event_label']} · 一分钟 {to_float(row['one_minute_return']):+.2f}% · {quantity}股",
+            "detail": f"{row.get('model_label') or row['event_label']} · 模型幅度 {to_float(row.get('model_return'), to_float(row['one_minute_return'])):+.2f}% · {quantity}股",
             "price": price, "quantity": quantity,
         })
 
@@ -2309,7 +2705,7 @@ def build_strategy_lab_preview(
     clean_trades = [{key: value for key, value in trade.items() if key != "_points"} for trade in trades]
     latest_portfolio = equity[-1]["portfolioValue"] if equity else initial_cash
     market_value = sum(to_float(trade["currentValue"]) for trade in clean_trades)
-    return {
+    return normalize_strategy_lab_preview({
         "date": trading_date, "verifiedThrough": verified, "initialCapital": initial_cash,
         "portfolioValue": latest_portfolio, "cash": cash, "marketValue": market_value,
         "returnPct": (latest_portfolio / initial_cash - 1) * 100,
@@ -2318,8 +2714,9 @@ def build_strategy_lab_preview(
         "failedOrders": failed, "openPositions": len(clean_trades),
         "winningPositions": sum(to_float(trade["unrealizedPnl"]) > 0 for trade in clean_trades),
         "trades": clean_trades, "events": events, "equity": equity,
-        "notice": "今日回放独立使用真实分钟数据，不会写入持续模拟账户；当日买入受T+1约束，仅显示浮动盈亏。",
-    }
+        "isStale": False,
+        "notice": "今日回放独立使用真实分钟数据，不会写入持续模拟账户；信号特征只计算到事件当时，当日买入受T+1约束，仅显示浮动盈亏。",
+    })
 
 
 def strategy_lab_active_config(state: dict[str, Any]) -> dict[str, Any]:
@@ -2348,15 +2745,16 @@ def strategy_lab_exit_point(
     verified: str,
     *,
     is_next_trading_day: bool = True,
+    config: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     if str(position.get("entry_date") or "") >= str((points[0] if points else {}).get("date") or ""):
-        return None, ""
-    if not is_next_trading_day:
         return None, ""
     eligible = [point for point in points if str(point.get("time") or "") <= verified]
     if not eligible:
         return None, ""
     mode = str(position.get("exit_mode") or "hold")
+    if mode in {"next_open", "next_0931", "risk_close"} and not is_next_trading_day:
+        return None, ""
     if mode == "next_open":
         return eligible[0], "次一交易日开盘"
     if mode == "next_0931":
@@ -2374,6 +2772,33 @@ def strategy_lab_exit_point(
                 return point, "止损触发"
         if verified >= "15:00":
             return eligible[-1], "次一交易日收盘"
+    if mode == "model_reverse":
+        model_config = validate_strategy_lab_config(config or {})
+        entry = to_float(position.get("entry_price"))
+        take = entry * (1 + to_float(position.get("take_profit_pct")) / 100)
+        stop = entry * (1 - to_float(position.get("stop_loss_pct")) / 100)
+        lookback_minutes = int(model_config.get("lookbackMinutes") or 5)
+        for index, point in enumerate(eligible):
+            price = to_float(point.get("price"))
+            if to_float(position.get("take_profit_pct")) > 0 and price >= take:
+                return point, "T+1可卖后止盈触发"
+            if to_float(position.get("stop_loss_pct")) > 0 and price <= stop:
+                return point, "T+1可卖后止损触发"
+            target = minute_number(str(point.get("time") or "")) - lookback_minutes
+            history = eligible[: index + 1]
+            base = next(
+                (item for item in history if minute_number(str(item.get("time") or "")) >= target),
+                history[0],
+            )
+            base_price = to_float(base.get("price"))
+            recent_return = (price / base_price - 1) * 100 if base_price > 0 else 0.0
+            vwap = to_float(point.get("average"))
+            model = str(model_config.get("signalModel") or "rapid_rise")
+            if model == "mean_reversion":
+                if vwap > 0 and price >= vwap and recent_return >= 0:
+                    return point, "价格回归VWAP，反向模型退出"
+            elif vwap > 0 and price < vwap and recent_return <= -max(0.25, to_float(model_config.get("oneMinuteRise")) / 2):
+                return point, "趋势转弱并跌破VWAP，反向模型退出"
     return None, ""
 
 
@@ -2401,8 +2826,9 @@ def process_continuous_strategy_lab(market: dict[str, Any]) -> None:
 
     # Existing positions keep the exit rule from the version that opened them.
     current_positions = [item for item in state.get("positions") or [] if item.get("status") == "open"]
+    fixed_next_day_modes = {"next_open", "next_0931", "risk_close"}
     needs_exit_calendar = any(
-        str(item.get("entry_date") or "") < trading_date and str(item.get("exit_mode") or "hold") != "hold"
+        str(item.get("entry_date") or "") < trading_date and str(item.get("exit_mode") or "hold") in fixed_next_day_modes
         for item in current_positions
     )
     trading_dates: list[str] = []
@@ -2411,6 +2837,10 @@ def process_continuous_strategy_lab(market: dict[str, Any]) -> None:
             trading_dates = recent_strategy_trading_dates()
         except Exception:
             trading_dates = []
+    version_configs = {
+        int(item.get("id") or 0): validate_strategy_lab_config(item.get("config") or {})
+        for item in state.get("versions") or []
+    }
     for position in current_positions:
         try:
             trend = fetch_verified_stock_trends(str(position["stock_code"]), int(position.get("market") or 0))
@@ -2429,7 +2859,7 @@ def process_continuous_strategy_lab(market: dict[str, Any]) -> None:
                 expected_exit_date
                 and trading_date > expected_exit_date
                 and previous_date < trading_date
-                and str(position.get("exit_mode") or "hold") != "hold"
+                and str(position.get("exit_mode") or "hold") in fixed_next_day_modes
             ):
                 STORE.append_strategy_lab_event({
                     "occurred_at": updated_at, "trading_date": trading_date, "event_time": str(latest["time"]),
@@ -2440,6 +2870,7 @@ def process_continuous_strategy_lab(market: dict[str, Any]) -> None:
                 })
             exit_point, reason = strategy_lab_exit_point(
                 position, points, verified, is_next_trading_day=is_next_trading_day,
+                config=version_configs.get(int(position.get("strategy_version_id") or 0), config),
             )
             if exit_point:
                 raw_exit = to_float(exit_point["price"])
@@ -2465,11 +2896,7 @@ def process_continuous_strategy_lab(market: dict[str, Any]) -> None:
     account = state.get("account") or account
     if str(account.get("status")) == "running":
         cursor = previous_time if previous_date == trading_date else "09:29"
-        rows = [
-            row for row in STORE.load_strategy_signals_for_date(trading_date)
-            if str(row.get("signal_time") or "") > cursor and strategy_lab_signal_matches(row, config, verified)
-        ]
-        trends = strategy_lab_prefetch_trends(rows)
+        rows, trends = prepare_strategy_lab_candidates(config, market, after_time=cursor)
         open_codes = {str(item["stock_code"]) for item in state.get("positions") or [] if item.get("status") == "open"}
         open_count = len(open_codes)
         retry_signal_times: list[str] = []
@@ -2532,7 +2959,7 @@ def process_continuous_strategy_lab(market: dict[str, Any]) -> None:
                     "occurred_at": updated_at, "trading_date": trading_date, "event_time": str(execution["time"]),
                     "event_type": "buy", "stock_code": code, "stock_name": str(row["stock_name"]),
                     "title": f"买入 {row['stock_name']}",
-                    "detail": f"{row['event_label']} · 一分钟 {to_float(row['one_minute_return']):+.2f}% · {quantity}股",
+                    "detail": f"{row.get('model_label') or row['event_label']} · 模型幅度 {to_float(row.get('model_return'), to_float(row['one_minute_return'])):+.2f}% · {quantity}股",
                     "price": price, "quantity": quantity, "amount": debit,
                     "strategy_version_id": int(account_now.get("active_version_id") or 0),
                 })
@@ -2602,6 +3029,16 @@ def serialize_strategy_lab_state(
         "date": str(market["date"]), "verifiedThrough": str(market["verifiedThrough"]),
         "updatedAt": now_cn().isoformat(timespec="seconds"), "source": STOCK_SOURCE_NAME,
         "defaultConfig": validate_strategy_lab_config({}), "activeConfig": active_config,
+        "presets": [
+            {
+                "id": str(item["id"]), "name": str(item["name"]),
+                "description": str(item["description"]), "dataStatus": str(item["dataStatus"]),
+                "config": validate_strategy_lab_config(item["config"]),
+            }
+            for item in STRATEGY_LAB_PRESETS
+        ],
+        "futureModels": STRATEGY_LAB_FUTURE_MODELS,
+        "previewHistory": load_strategy_lab_preview_history(),
         "strategySummary": strategy_lab_summary(active_config), "preview": preview,
         "account": None if not account else {
             "status": str(account["status"]), "initialCash": initial_cash, "cash": cash,
@@ -2641,7 +3078,7 @@ def serialize_strategy_lab_state(
             "stampDutyRate": STRATEGY_STAMP_DUTY_RATE * 100,
             "slippagePerSide": STRATEGY_SLIPPAGE_RATE * 100,
         },
-        "dataNotice": "只使用各时点已经出现的真实信号和分钟价格；缺失交易日不会估算。若错过规则要求的次日精确分钟价，持仓会保留并记录缺口，不会用更晚日期冒充。持续模拟不连接券商，不会产生真实订单。",
+        "dataNotice": "当前可运行模型只使用各时点已经出现的真实异动、分钟价格、成交量、VWAP与已保存板块快照；缺失交易日不会估算。估值、配对、机器学习和订单流模型在数据条件满足前保持禁用。若错过规则要求的次日精确分钟价，持仓会保留并记录缺口，不会用更晚日期冒充。持续模拟不连接券商，不会产生真实订单。",
     }
 
 
@@ -2649,14 +3086,61 @@ def prepare_strategy_lab_market() -> dict[str, Any]:
     market = fetch_strategy_market()
     with _STRATEGY_LOCK:
         capture_strategy_signals(market)
+    write_cache("strategy-lab-market-latest", market)
     return market
 
 
+def load_strategy_lab_market_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """Build the strategy page from saved real observations without blocking on a crawl."""
+    cached = read_cache("strategy-lab-market-latest")
+    account = state.get("account") or {}
+    account_date = str(account.get("last_processed_date") or "")
+    account_time = str(account.get("last_processed_time") or "")
+    if isinstance(cached, dict) and cached.get("date") and cached.get("verifiedThrough"):
+        cached_cursor = (str(cached["date"]), str(cached["verifiedThrough"]))
+        if not account_date or cached_cursor >= (account_date, account_time):
+            return cached
+
+    equity = list(state.get("equity") or [])
+    if equity:
+        latest = equity[-1]
+        trading_date = str(latest.get("trading_date") or account_date)
+        same_day = [item for item in equity if str(item.get("trading_date") or "") == trading_date]
+        return {
+            "date": trading_date,
+            "verifiedThrough": str(latest.get("point_time") or account_time),
+            "index": {
+                "code": "000985", "name": "中证全指", "preClose": 0,
+                "points": [
+                    {
+                        "date": trading_date, "time": str(item.get("point_time") or ""),
+                        "value": to_float(item.get("benchmark_value")),
+                        "changePct": to_float(item.get("benchmark_return_pct")),
+                    }
+                    for item in same_day
+                ],
+            },
+            "events": [],
+        }
+
+    return {
+        "date": account_date or now_cn().date().isoformat(),
+        "verifiedThrough": account_time,
+        "index": {"code": "000985", "name": "中证全指", "preClose": 0, "points": []},
+        "events": [],
+    }
+
+
 def collect_strategy_lab() -> dict[str, Any]:
-    with _STRATEGY_LAB_LOCK:
-        market = prepare_strategy_lab_market()
-        process_continuous_strategy_lab(market)
-        return serialize_strategy_lab_state(STORE.load_strategy_lab_state(), market)
+    # Page reads must stay responsive even while the background collector is
+    # crawling public sources. Trading decisions are still updated by the
+    # collector under ``_STRATEGY_LAB_LOCK``; this endpoint only serializes
+    # already saved real observations.
+    state = STORE.load_strategy_lab_state()
+    market = load_strategy_lab_market_snapshot(state)
+    config = strategy_lab_active_config(state) if state.get("account") else validate_strategy_lab_config({})
+    preview = load_strategy_lab_preview(config, market)
+    return serialize_strategy_lab_state(state, market, preview)
 
 
 def handle_strategy_lab_action(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2666,6 +3150,7 @@ def handle_strategy_lab_action(payload: dict[str, Any]) -> dict[str, Any]:
         config = validate_strategy_lab_config(payload.get("config"))
         if action == "preview":
             preview = build_strategy_lab_preview(config, market)
+            save_strategy_lab_preview(config, preview)
             return serialize_strategy_lab_state(STORE.load_strategy_lab_state(), market, preview)
         if action in {"start", "update", "resume"}:
             # A rule change becomes effective at the current verified minute.

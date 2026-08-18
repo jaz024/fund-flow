@@ -228,8 +228,12 @@ export type StrategyData = {
 
 export type StrategyLabConfig = {
   name: string;
+  signalModel: "rapid_rise" | "trend" | "mean_reversion" | "volatility_breakout";
   marketScope: "all" | "sh" | "sz" | "bj";
   oneMinuteRise: number;
+  lookbackMinutes: number;
+  vwapFilter: "any" | "above" | "below";
+  minVolumeRatio: number;
   sectorFilter: "both" | "flow" | "rise" | "none";
   minAmount: number;
   minScore: number;
@@ -240,7 +244,7 @@ export type StrategyLabConfig = {
   allocationMode: "fixed_pct" | "equal_slots";
   positionPct: number;
   maxPositions: number;
-  exitMode: "next_open" | "next_0931" | "risk_close" | "hold";
+  exitMode: "next_open" | "next_0931" | "risk_close" | "model_reverse" | "hold";
   takeProfitPct: number;
   stopLossPct: number;
   initialCapital: number;
@@ -260,11 +264,13 @@ export type StrategyLabEvent = {
 export type StrategyLabPosition = {
   id?: number; code: string; market: number; name: string; quantity: number;
   entryDate?: string; entryTime: string; entryPrice: number; rawExecutionPrice?: number;
+  executionTime?: string; executionPrice?: number;
   entryCost: number; status: "open" | "closed"; lastPrice?: number;
   lastPriceTime?: string; currentPrice?: number; currentValue?: number; pnl?: number;
   unrealizedPnl?: number; returnPct?: number; unrealizedReturn?: number;
   exitDate?: string; exitTime?: string; exitPrice?: number; exitCost?: number;
   signalTime?: string; oneMinuteReturn?: number; industryName?: string;
+  modelReturn?: number; modelLabel?: string; volumeRatio?: number; vwapDistance?: number;
   sectorChangePct?: number; sectorMainFlow?: number; score?: number;
   strategyVersionId?: number; exitMode?: string;
 };
@@ -275,11 +281,22 @@ export type StrategyLabPreview = {
   fees: number; signalsMatched: number; tradesFilled: number; failedOrders: number;
   openPositions: number; winningPositions: number; trades: StrategyLabPosition[];
   events: StrategyLabEvent[]; equity: StrategyLabEquityPoint[]; notice: string;
+  isStale?: boolean;
 };
 
 export type StrategyLabData = {
   date: string; verifiedThrough: string; updatedAt: string; source: string;
   defaultConfig: StrategyLabConfig; activeConfig: StrategyLabConfig;
+  presets: Array<{
+    id: StrategyLabConfig["signalModel"]; name: string; description: string;
+    dataStatus: "ready"; config: StrategyLabConfig;
+  }>;
+  futureModels: Array<{ id: string; name: string; requirement: string }>;
+  previewHistory: Array<{
+    id: string; savedAt: string; date: string; verifiedThrough: string;
+    sessionStatus: "closed" | "intraday"; strategyName: string;
+    strategySummary: string; config: StrategyLabConfig; preview: StrategyLabPreview;
+  }>;
   strategySummary: string; preview: StrategyLabPreview | null;
   account: null | {
     status: "running" | "paused"; initialCash: number; cash: number;
@@ -327,8 +344,23 @@ export function formatWanYi(value: number): string {
   return value.toFixed(0);
 }
 
-export async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+async function requestWithTimeout(path: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+  } catch (reason) {
+    if (reason instanceof Error && reason.name === "AbortError") {
+      throw new Error(`行情核验超过 ${Math.round(timeoutMs / 1000)} 秒，已停止页面等待。后台完成后重新读取即可恢复结果。`);
+    }
+    throw reason;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+export async function fetchJson<T>(path: string, timeoutMs = 90_000): Promise<T> {
+  const response = await requestWithTimeout(path, { cache: "no-store" }, timeoutMs);
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: "本地服务未响应" }));
     throw new Error(payload.error || `请求失败 (${response.status})`);
@@ -336,13 +368,13 @@ export async function fetchJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function postJson<T>(path: string, payload: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+export async function postJson<T>(path: string, payload: unknown, timeoutMs = 90_000): Promise<T> {
+  const response = await requestWithTimeout(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
     cache: "no-store",
-  });
+  }, timeoutMs);
   if (!response.ok) {
     const result = await response.json().catch(() => ({ error: "本地服务未响应" }));
     throw new Error(result.error || `请求失败 (${response.status})`);

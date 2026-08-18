@@ -25,11 +25,11 @@ url_is_ready() {
 }
 
 api_is_current() {
-  /usr/bin/curl --silent --fail --connect-timeout 1 --max-time 3 "$API_HEALTH_URL" 2>/dev/null | /usr/bin/grep -q '"apiVersion":5'
+  /usr/bin/curl --silent --fail --connect-timeout 1 --max-time 3 "$API_HEALTH_URL" 2>/dev/null | /usr/bin/grep -q '"apiVersion":8'
 }
 
 web_is_current() {
-  /usr/bin/curl --silent --fail --connect-timeout 1 --max-time 5 "$1/strategy" 2>/dev/null | /usr/bin/grep -q 'data-fund-flow-version="5"'
+  /usr/bin/curl --silent --fail --connect-timeout 1 --max-time 5 "$1/strategy" 2>/dev/null | /usr/bin/grep -q 'data-fund-flow-version="8"'
 }
 
 stop_orphaned_web() {

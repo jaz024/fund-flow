@@ -359,6 +359,133 @@ class LocalServerTests(unittest.TestCase):
         self.assertIsNone(server.STORE.load_strategy_lab_state()["account"])
         self.assertLess(max(point["portfolioValue"] for point in preview["equity"]), 101_000)
 
+    def test_strategy_lab_presets_cover_distinct_causal_models(self) -> None:
+        presets = {item["id"]: server.validate_strategy_lab_config(item["config"]) for item in server.STRATEGY_LAB_PRESETS}
+        self.assertEqual(set(presets), {"rapid_rise", "trend", "mean_reversion", "volatility_breakout"})
+        self.assertEqual(presets["mean_reversion"]["vwapFilter"], "below")
+        self.assertEqual(presets["trend"]["exitMode"], "model_reverse")
+        self.assertEqual(presets["volatility_breakout"]["vwapFilter"], "above")
+
+    def test_mean_reversion_can_buy_a_falling_stock_without_future_prices(self) -> None:
+        trading_date = "2026-08-13"
+        config = server.validate_strategy_lab_config({
+            **next(item["config"] for item in server.STRATEGY_LAB_PRESETS if item["id"] == "mean_reversion"),
+            "minAmount": 0, "minScore": 0, "minVolumeRatio": 0,
+        })
+        market = {
+            "date": trading_date, "verifiedThrough": "10:06",
+            "events": [{
+                "code": "000001", "market": 0, "name": "平安银行", "time": "10:05",
+                "eventType": 8204, "event": "加速下跌", "direction": -1, "severity": 2,
+            }],
+        }
+        trend = {"preClose": 10.2, "points": [
+            {"date": trading_date, "time": "10:00", "price": 10.2, "high": 10.2, "average": 10.1, "volume": 100, "amount": 1_000_000},
+            {"date": trading_date, "time": "10:04", "price": 10.0, "high": 10.05, "average": 10.08, "volume": 100, "amount": 1_000_000},
+            {"date": trading_date, "time": "10:05", "price": 9.8, "high": 10.0, "average": 10.05, "volume": 180, "amount": 1_800_000},
+            # This later rebound must not influence the 10:05 decision.
+            {"date": trading_date, "time": "10:06", "price": 10.5, "high": 10.5, "average": 10.1, "volume": 500, "amount": 5_000_000},
+        ]}
+        with mock.patch.object(server, "strategy_lab_prefetch_trends", return_value={"000001": trend}):
+            rows, _ = server.prepare_strategy_lab_candidates(config, market)
+
+        self.assertEqual(len(rows), 1)
+        self.assertLess(rows[0]["model_return"], 0)
+        self.assertEqual(rows[0]["signal_price"], 9.8)
+
+    def test_volatility_breakout_uses_only_the_prior_window_high(self) -> None:
+        trading_date = "2026-08-13"
+        config = server.validate_strategy_lab_config({
+            **next(item["config"] for item in server.STRATEGY_LAB_PRESETS if item["id"] == "volatility_breakout"),
+            "minAmount": 0, "minScore": 0, "minVolumeRatio": 0, "sectorFilter": "none",
+        })
+        market = {
+            "date": trading_date, "verifiedThrough": "10:05",
+            "events": [{
+                "code": "000001", "market": 0, "name": "平安银行", "time": "10:05",
+                "eventType": 8201, "event": "火箭发射", "direction": 1, "severity": 2,
+            }],
+        }
+        trend = {"preClose": 10.0, "points": [
+            {"date": trading_date, "time": "09:50", "price": 10.0, "high": 10.05, "average": 10.0, "volume": 100, "amount": 1_000_000},
+            {"date": trading_date, "time": "10:04", "price": 10.05, "high": 10.1, "average": 10.02, "volume": 100, "amount": 1_000_000},
+            {"date": trading_date, "time": "10:05", "price": 10.4, "high": 10.4, "average": 10.08, "volume": 220, "amount": 2_200_000},
+        ]}
+        with mock.patch.object(server, "strategy_lab_prefetch_trends", return_value={"000001": trend}):
+            rows, _ = server.prepare_strategy_lab_candidates(config, market)
+
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0]["breakout_return"], config["oneMinuteRise"])
+
+    def test_strategy_lab_preview_survives_reload_and_marks_older_result(self) -> None:
+        config = server.validate_strategy_lab_config({})
+        preview = {
+            "date": "2026-08-13", "verifiedThrough": "11:20", "equity": [{"time": "11:20"}],
+            "notice": "真实分钟回放", "portfolioValue": 100_100,
+        }
+        server.save_strategy_lab_preview(config, preview)
+
+        exact = server.load_strategy_lab_preview(config, {
+            "date": "2026-08-13", "verifiedThrough": "11:20",
+        })
+        self.assertIsNotNone(exact)
+        self.assertFalse(exact["isStale"])
+        self.assertEqual(exact["portfolioValue"], 100_100)
+
+        later = server.load_strategy_lab_preview(config, {
+            "date": "2026-08-13", "verifiedThrough": "14:05",
+        })
+        self.assertIsNotNone(later)
+        self.assertTrue(later["isStale"])
+        self.assertIn("11:20", later["notice"])
+
+        other_config = server.validate_strategy_lab_config({"oneMinuteRise": 1.5})
+        self.assertIsNone(server.load_strategy_lab_preview(other_config, {
+            "date": "2026-08-13", "verifiedThrough": "14:05",
+        }))
+
+        history = server.load_strategy_lab_preview_history()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["date"], "2026-08-13")
+        self.assertEqual(history[0]["strategyName"], config["name"])
+        self.assertEqual(history[0]["sessionStatus"], "intraday")
+        self.assertEqual(history[0]["preview"]["portfolioValue"], 100_100)
+
+    def test_strategy_lab_history_normalizes_legacy_execution_fields(self) -> None:
+        config = server.validate_strategy_lab_config({})
+        trading_date = "2026-08-12"
+        legacy_preview = {
+            "date": trading_date,
+            "verifiedThrough": "15:00",
+            "equity": [{"date": trading_date, "time": "15:00", "returnPct": 0.5}],
+            "trades": [{
+                "code": "000001", "market": 0, "name": "平安银行", "quantity": 100,
+                "executionTime": "10:01", "executionPrice": 10.12, "status": "open",
+            }],
+        }
+        server.write_cache(server.strategy_lab_preview_cache_name(config, trading_date), {
+            "config": config, "savedAt": f"{trading_date}T15:01:00", "preview": legacy_preview,
+        })
+
+        history = server.load_strategy_lab_preview_history()
+
+        self.assertEqual(len(history), 1)
+        trade = history[0]["preview"]["trades"][0]
+        self.assertEqual(trade["entryDate"], trading_date)
+        self.assertEqual(trade["entryTime"], "10:01")
+        self.assertEqual(trade["entryPrice"], 10.12)
+        self.assertEqual(trade["executionTime"], "10:01")
+        self.assertEqual(trade["executionPrice"], 10.12)
+
+    def test_strategy_lab_page_read_never_starts_a_network_crawl(self) -> None:
+        with mock.patch.object(
+            server, "prepare_strategy_lab_market", side_effect=AssertionError("GET must stay local"),
+        ):
+            payload = server.collect_strategy_lab()
+
+        self.assertIn("activeConfig", payload)
+        self.assertIn("preview", payload)
+
     def test_strategy_lab_exit_enforces_t_plus_one(self) -> None:
         position = {
             "entry_date": "2026-08-13", "entry_price": 10, "exit_mode": "next_open",
