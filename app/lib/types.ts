@@ -273,6 +273,9 @@ export type StrategyLabPosition = {
   modelReturn?: number; modelLabel?: string; volumeRatio?: number; vwapDistance?: number;
   sectorChangePct?: number; sectorMainFlow?: number; score?: number;
   strategyVersionId?: number; exitMode?: string;
+  nextOpenDate?: string; nextOpenPrice?: number; nextOpenExitPrice?: number;
+  nextOpenExitCost?: number; nextOpenNetValue?: number; nextOpenReturnPct?: number;
+  nextOpenReturnAfterCostPct?: number; nextOpenSource?: string; nextOpenVerifiedBy?: string[];
 };
 
 export type StrategyLabPreview = {
@@ -282,6 +285,12 @@ export type StrategyLabPreview = {
   openPositions: number; winningPositions: number; trades: StrategyLabPosition[];
   events: StrategyLabEvent[]; equity: StrategyLabEquityPoint[]; notice: string;
   isStale?: boolean;
+  nextOpenStatus?: "complete" | "partial"; nextOpenDate?: string;
+  nextOpenCompletedTrades?: number; nextOpenPendingTrades?: number;
+  nextOpenPortfolioValue?: number; nextOpenReturnPct?: number; nextOpenUpdatedAt?: string;
+  benchmarkNextOpenDate?: string; benchmarkPreviousClose?: number;
+  benchmarkNextOpenPrice?: number; benchmarkNextOpenGapPct?: number;
+  benchmarkNextOpenSource?: string;
 };
 
 export type StrategyLabData = {

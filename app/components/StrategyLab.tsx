@@ -43,6 +43,11 @@ function replayEntryPrice(position: StrategyLabPosition) {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "--";
 }
 
+function replayNextOpenPrice(position: StrategyLabPosition) {
+  const value = position.nextOpenPrice;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value.toFixed(2) : "等待补录";
+}
+
 export default function StrategyLab() {
   const [data, setData] = useState<StrategyLabData | null>(null);
   const [config, setConfig] = useState<StrategyLabConfig | null>(null);
@@ -233,9 +238,10 @@ export default function StrategyLab() {
             <article><span>信号 / 成交</span><strong>{selectedHistory.preview.signalsMatched} / {selectedHistory.preview.tradesFilled}</strong><small>{selectedHistory.preview.failedOrders} 个未成交</small></article>
             <article><span>费用与滑点</span><strong>{money(selectedHistory.preview.fees)}</strong><small>期末现金 {money(selectedHistory.preview.cash)}</small></article>
           </div>
+          <div className={`strategy-next-open-summary ${selectedHistory.preview.nextOpenStatus || "pending"}`}><div><span className="eyebrow">NEXT SESSION OPEN</span><strong>次一交易日开盘观察</strong><p>{selectedHistory.preview.nextOpenDate ? `${selectedHistory.preview.nextOpenDate} 已用真实日线开盘价补录` : "下一交易日开盘后自动补录；不会用估算价格代替"}</p></div><div><span>若开盘卖出 · 组合含成本收益</span><strong className={(selectedHistory.preview.nextOpenReturnPct || 0) >= 0 ? "up" : "down"}>{selectedHistory.preview.nextOpenReturnPct === undefined ? "等待开盘" : formatPercent(selectedHistory.preview.nextOpenReturnPct, 3)}</strong></div><div><span>中证全指隔夜开盘</span><strong className={(selectedHistory.preview.benchmarkNextOpenGapPct || 0) >= 0 ? "up" : "down"}>{selectedHistory.preview.benchmarkNextOpenGapPct === undefined ? "等待开盘" : formatPercent(selectedHistory.preview.benchmarkNextOpenGapPct, 3)}</strong></div><div><span>补录进度</span><strong>{selectedHistory.preview.nextOpenCompletedTrades || 0} / {selectedHistory.preview.tradesFilled}</strong></div></div>
           <div className="strategy-chart-panel history-replay-chart"><div className="strategy-chart-legend"><span><i className="portfolio" />模拟组合</span><span><i className="benchmark" />中证全指</span><span><i className="buy" />买入</span></div><StrategyEquityChart points={selectedHistory.preview.equity} events={selectedHistory.preview.events} label={`${selectedHistory.date} 历史策略回放`} /></div>
           <div className="strategy-history-rule"><strong>当日策略</strong><p>{selectedHistory.strategySummary}</p></div>
-          <div className="strategy-history-trades"><div className="strategy-subheading"><h3>当日模拟成交</h3><span>{selectedHistory.preview.tradesFilled} 笔</span></div><div className="strategy-history-trade-list">{selectedHistory.preview.trades.map((trade) => <Link key={`${trade.code}-${replayEntryTime(trade)}`} href={`/stocks/${trade.code}?market=${trade.market}&name=${encodeURIComponent(trade.name)}`}><div><strong>{trade.name}</strong><small>{trade.code} · {trade.modelLabel || "策略信号"} · {trade.signalTime}</small></div><div><span>{replayEntryTime(trade)} 买入 {trade.quantity}股</span><strong>{replayEntryPrice(trade)}</strong></div><div><span>期末收益</span><strong className={(trade.unrealizedReturn || 0) >= 0 ? "up" : "down"}>{formatPercent(trade.unrealizedReturn || 0, 3)}</strong></div></Link>)}{!selectedHistory.preview.trades.length && <div className="strategy-empty">这个回放没有产生模拟成交。</div>}</div></div>
+          <div className="strategy-history-trades"><div className="strategy-subheading"><h3>当日模拟成交</h3><span>{selectedHistory.preview.tradesFilled} 笔</span></div><div className="strategy-history-trade-list">{selectedHistory.preview.trades.map((trade) => <Link key={`${trade.code}-${replayEntryTime(trade)}`} href={`/stocks/${trade.code}?market=${trade.market}&name=${encodeURIComponent(trade.name)}`}><div><strong>{trade.name}</strong><small>{trade.code} · {trade.modelLabel || "策略信号"} · {trade.signalTime}</small></div><div><span>{replayEntryTime(trade)} 买入 {trade.quantity}股</span><strong>{replayEntryPrice(trade)}</strong></div><div><span>当日收盘浮盈</span><strong className={(trade.unrealizedReturn || 0) >= 0 ? "up" : "down"}>{formatPercent(trade.unrealizedReturn || 0, 3)}</strong></div><div><span>{trade.nextOpenDate ? `${trade.nextOpenDate} 开盘` : "次日开盘"} · {replayNextOpenPrice(trade)}</span><strong className={(trade.nextOpenReturnAfterCostPct || 0) >= 0 ? "up" : "down"}>{trade.nextOpenReturnAfterCostPct === undefined ? "等待真实数据" : `${formatPercent(trade.nextOpenReturnAfterCostPct, 3)} · 若卖出`}</strong></div></Link>)}{!selectedHistory.preview.trades.length && <div className="strategy-empty">这个回放没有产生模拟成交。</div>}</div></div>
         </> : <div className="strategy-empty">选择一个保存日期查看完整回放。</div>}</div>
       </div>}
     </section>

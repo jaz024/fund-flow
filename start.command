@@ -25,7 +25,7 @@ url_is_ready() {
 }
 
 api_is_current() {
-  /usr/bin/curl --silent --fail --connect-timeout 1 --max-time 3 "$API_HEALTH_URL" 2>/dev/null | /usr/bin/grep -q '"apiVersion":8'
+  /usr/bin/curl --silent --fail --connect-timeout 1 --max-time 3 "$API_HEALTH_URL" 2>/dev/null | /usr/bin/grep -q '"apiVersion":9'
 }
 
 web_is_current() {

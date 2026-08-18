@@ -51,7 +51,7 @@ function Test-LocalUrl {
 function Test-CurrentApi {
     try {
         $health = Invoke-RestMethod -Uri $apiHealthUrl -TimeoutSec 3
-        return $health.app -eq "fund-flow" -and [int]$health.apiVersion -eq 5
+        return $health.app -eq "fund-flow" -and [int]$health.apiVersion -eq 9
     }
     catch {
         return $false

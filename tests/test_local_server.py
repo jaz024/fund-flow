@@ -477,6 +477,56 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(trade["executionTime"], "10:01")
         self.assertEqual(trade["executionPrice"], 10.12)
 
+    def test_strategy_lab_history_appends_real_next_trading_day_open(self) -> None:
+        config = server.validate_strategy_lab_config({})
+        trading_date = "2026-08-14"
+        preview = {
+            "date": trading_date, "verifiedThrough": "15:00", "initialCapital": 100_000,
+            "cash": 98_987.7, "equity": [{"date": trading_date, "time": "15:00", "returnPct": 0.1}],
+            "tradesFilled": 1,
+            "trades": [{
+                "code": "000001", "market": 0, "name": "平安银行", "quantity": 100,
+                "executionTime": "10:01", "executionPrice": 10.12, "entryCost": 0.31,
+                "debit": 1_012.31, "status": "open",
+            }],
+        }
+        server.write_cache(server.strategy_lab_preview_cache_name(config, trading_date), {
+            "config": config, "savedAt": f"{trading_date}T15:01:00", "preview": preview,
+        })
+
+        def daily(code: str, market: int) -> dict:
+            if code == "000985":
+                return {
+                    "points": [
+                        {"date": trading_date, "open": 4000, "close": 4020},
+                        {"date": "2026-08-17", "open": 4040, "close": 4050},
+                    ],
+                    "source": "真实指数日线", "verifiedBy": ["源A", "源B"],
+                }
+            return {
+                "points": [
+                    {"date": trading_date, "open": 10, "close": 10.2},
+                    {"date": "2026-08-17", "open": 10.5, "close": 10.6},
+                ],
+                "source": "真实股票日线", "verifiedBy": ["源A", "源B"],
+            }
+
+        with mock.patch.object(server, "fetch_stock_daily", side_effect=daily):
+            result = server.enrich_strategy_lab_preview_next_opens("2026-08-17")
+
+        self.assertEqual(result, {"updated": 1, "pending": 0})
+        history = server.load_strategy_lab_preview_history()
+        enriched = history[0]["preview"]
+        trade = enriched["trades"][0]
+        self.assertEqual(trade["nextOpenDate"], "2026-08-17")
+        self.assertEqual(trade["nextOpenPrice"], 10.5)
+        self.assertEqual(trade["nextOpenVerifiedBy"], ["源A", "源B"])
+        self.assertGreater(trade["nextOpenReturnAfterCostPct"], 3)
+        self.assertEqual(enriched["nextOpenStatus"], "complete")
+        self.assertEqual(enriched["nextOpenCompletedTrades"], 1)
+        self.assertGreater(enriched["nextOpenReturnPct"], 0)
+        self.assertAlmostEqual(enriched["benchmarkNextOpenGapPct"], (4040 / 4020 - 1) * 100)
+
     def test_strategy_lab_page_read_never_starts_a_network_crawl(self) -> None:
         with mock.patch.object(
             server, "prepare_strategy_lab_market", side_effect=AssertionError("GET must stay local"),

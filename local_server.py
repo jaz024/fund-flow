@@ -45,7 +45,7 @@ EASTMONEY_MINUTE_SOURCE = "东方财富真实分钟资金（延时）"
 STOCK_SOURCE_NAME = "东方财富公开个股行情（延时）"
 SINA_STOCK_SOURCE = "新浪财经公开个股行情"
 TENCENT_STOCK_SOURCE = "腾讯证券公开个股行情"
-API_VERSION = 8
+API_VERSION = 9
 THS_SOURCE_NAME = "同花顺公开网页"
 EASTMONEY_UT = "b2884a393a59ad64002292a3e90d46a5"
 EASTMONEY_CHANGE_UT = "7eea3edcaed734bea9cbfc24409ed989"
@@ -2595,6 +2595,174 @@ def load_strategy_lab_preview_history(limit: int = 90) -> list[dict[str, Any]]:
     )[: max(1, limit)]
 
 
+def strategy_lab_preview_next_open_result(trade: dict[str, Any], raw_open: float) -> dict[str, float]:
+    """Value one replay position at a real next-session open, including exit costs."""
+    entry_price = to_float(trade.get("entryPrice"), to_float(trade.get("executionPrice")))
+    quantity = int(trade.get("quantity") or 0)
+    if entry_price <= 0 or raw_open <= 0 or quantity <= 0:
+        return {}
+    entry_debit = to_float(trade.get("debit"))
+    if entry_debit <= 0:
+        entry_debit = quantity * entry_price + to_float(trade.get("entryCost"))
+    exit_price = raw_open * (1 - STRATEGY_SLIPPAGE_RATE)
+    exit_gross = quantity * exit_price
+    exit_cost = exit_gross * (
+        STRATEGY_COMMISSION_RATE
+        + STRATEGY_TRANSFER_AND_REGULATORY_RATE
+        + STRATEGY_STAMP_DUTY_RATE
+    )
+    net_value = exit_gross - exit_cost
+    return {
+        "nextOpenPrice": raw_open,
+        "nextOpenExitPrice": exit_price,
+        "nextOpenExitCost": exit_cost,
+        "nextOpenNetValue": net_value,
+        "nextOpenReturnPct": (raw_open / entry_price - 1) * 100,
+        "nextOpenReturnAfterCostPct": (net_value / entry_debit - 1) * 100 if entry_debit > 0 else 0,
+    }
+
+
+def enrich_strategy_lab_preview_next_opens(current_trading_date: str, limit: int = 90) -> dict[str, int]:
+    """Append verified next-session opens to closed replay files without recomputing them."""
+    try:
+        current_date = dt.date.fromisoformat(current_trading_date)
+        paths = sorted(
+            CACHE_DIR.glob("strategy-lab-preview-*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )[: max(1, limit)]
+    except (ValueError, OSError):
+        return {"updated": 0, "pending": 0}
+
+    candidates: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
+    identities: set[tuple[str, int]] = set()
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        preview = payload.get("preview") if isinstance(payload, dict) else None
+        if not isinstance(preview, dict) or str(preview.get("verifiedThrough") or "") < "15:00":
+            continue
+        try:
+            replay_date = dt.date.fromisoformat(str(preview.get("date") or ""))
+        except ValueError:
+            continue
+        if replay_date >= current_date:
+            continue
+        normalized = normalize_strategy_lab_preview(preview)
+        trades = list(normalized.get("trades") or [])
+        needs_trade_open = any(to_float(trade.get("nextOpenPrice")) <= 0 for trade in trades)
+        needs_benchmark_open = to_float(normalized.get("benchmarkNextOpenPrice")) <= 0
+        if not trades or (not needs_trade_open and not needs_benchmark_open):
+            continue
+        for trade in trades:
+            if to_float(trade.get("nextOpenPrice")) <= 0:
+                identities.add((str(trade.get("code") or ""), int(trade.get("market") or 0)))
+        candidates.append((path, payload, normalized))
+
+    if not candidates:
+        return {"updated": 0, "pending": 0}
+
+    daily_by_identity: dict[tuple[str, int], dict[str, Any] | Exception] = {}
+    valid_identities = {identity for identity in identities if identity[0].isdigit()}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(fetch_stock_daily, code, market): (code, market)
+            for code, market in valid_identities
+        }
+        for future in concurrent.futures.as_completed(futures):
+            identity = futures[future]
+            try:
+                daily_by_identity[identity] = future.result()
+            except Exception as exc:
+                daily_by_identity[identity] = exc
+
+    benchmark_daily: dict[str, Any] | None = None
+    try:
+        benchmark_daily = fetch_stock_daily("000985", 1)
+    except Exception:
+        pass
+
+    updated_files = 0
+    pending_trades = 0
+    for path, payload, preview in candidates:
+        replay_date = str(preview.get("date") or "")
+        changed = False
+        expected_next_date = str(preview.get("benchmarkNextOpenDate") or "")
+        if benchmark_daily and to_float(preview.get("benchmarkNextOpenPrice")) <= 0:
+            benchmark_points = sorted(
+                list(benchmark_daily.get("points") or []),
+                key=lambda point: str(point.get("date") or ""),
+            )
+            benchmark_index = next(
+                (index for index, point in enumerate(benchmark_points) if str(point.get("date") or "") == replay_date),
+                -1,
+            )
+            if benchmark_index >= 0 and benchmark_index + 1 < len(benchmark_points):
+                prior_day = benchmark_points[benchmark_index]
+                next_day = benchmark_points[benchmark_index + 1]
+                next_date = str(next_day.get("date") or "")
+                prior_close = to_float(prior_day.get("close"))
+                next_open = to_float(next_day.get("open"))
+                if next_date and next_date <= current_trading_date and prior_close > 0 and next_open > 0:
+                    expected_next_date = next_date
+                    preview["benchmarkNextOpenDate"] = next_date
+                    preview["benchmarkPreviousClose"] = prior_close
+                    preview["benchmarkNextOpenPrice"] = next_open
+                    preview["benchmarkNextOpenGapPct"] = (next_open / prior_close - 1) * 100
+                    preview["benchmarkNextOpenSource"] = str(benchmark_daily.get("source") or "公开真实日线")
+                    changed = True
+
+        enriched_trades: list[dict[str, Any]] = []
+        for original in preview.get("trades") or []:
+            trade = dict(original)
+            if to_float(trade.get("nextOpenPrice")) <= 0:
+                identity = (str(trade.get("code") or ""), int(trade.get("market") or 0))
+                daily = daily_by_identity.get(identity)
+                if isinstance(daily, dict):
+                    points = sorted(list(daily.get("points") or []), key=lambda point: str(point.get("date") or ""))
+                    trade_index = next((index for index, point in enumerate(points) if str(point.get("date") or "") == replay_date), -1)
+                    if trade_index >= 0 and trade_index + 1 < len(points):
+                        next_day = points[trade_index + 1]
+                        next_date = str(next_day.get("date") or "")
+                        raw_open = to_float(next_day.get("open"))
+                        if next_date == expected_next_date and raw_open > 0:
+                            result = strategy_lab_preview_next_open_result(trade, raw_open)
+                            if result:
+                                trade.update(result)
+                                trade["nextOpenDate"] = next_date
+                                trade["nextOpenSource"] = str(daily.get("source") or "公开真实日线")
+                                trade["nextOpenVerifiedBy"] = list(daily.get("verifiedBy") or [trade["nextOpenSource"]])
+                                changed = True
+            if to_float(trade.get("nextOpenPrice")) <= 0:
+                pending_trades += 1
+            enriched_trades.append(trade)
+        preview["trades"] = enriched_trades
+
+        completed = [trade for trade in enriched_trades if to_float(trade.get("nextOpenPrice")) > 0]
+        preview["nextOpenCompletedTrades"] = len(completed)
+        preview["nextOpenPendingTrades"] = len(enriched_trades) - len(completed)
+        preview["nextOpenStatus"] = "complete" if len(completed) == len(enriched_trades) else "partial"
+        next_dates = sorted({str(trade.get("nextOpenDate") or "") for trade in completed if trade.get("nextOpenDate")})
+        if next_dates:
+            preview["nextOpenDate"] = next_dates[-1]
+        if enriched_trades and len(completed) == len(enriched_trades):
+            portfolio_value = to_float(preview.get("cash")) + sum(to_float(trade.get("nextOpenNetValue")) for trade in completed)
+            initial_capital = to_float(preview.get("initialCapital"))
+            preview["nextOpenPortfolioValue"] = portfolio_value
+            preview["nextOpenReturnPct"] = (portfolio_value / initial_capital - 1) * 100 if initial_capital > 0 else 0
+        preview["nextOpenUpdatedAt"] = now_cn().isoformat(timespec="seconds")
+
+        if changed:
+            payload["preview"] = preview
+            payload["nextOpenUpdatedAt"] = preview["nextOpenUpdatedAt"]
+            write_cache(path.stem, payload)
+            updated_files += 1
+
+    return {"updated": updated_files, "pending": pending_trades}
+
+
 def build_strategy_lab_preview(
     config: dict[str, Any],
     market: dict[str, Any],
@@ -3151,6 +3319,7 @@ def handle_strategy_lab_action(payload: dict[str, Any]) -> dict[str, Any]:
         if action == "preview":
             preview = build_strategy_lab_preview(config, market)
             save_strategy_lab_preview(config, preview)
+            enrich_strategy_lab_preview_next_opens(str(market["date"]))
             return serialize_strategy_lab_state(STORE.load_strategy_lab_state(), market, preview)
         if action in {"start", "update", "resume"}:
             # A rule change becomes effective at the current verified minute.
@@ -3866,6 +4035,7 @@ def background_strategy_collector(stop_event: threading.Event) -> None:
                 with _STRATEGY_LAB_LOCK:
                     market = prepare_strategy_lab_market()
                     process_continuous_strategy_lab(market)
+                    enrich_strategy_lab_preview_next_opens(str(market["date"]))
                 startup_reconciled = True
             except Exception as exc:
                 print(f"后台策略信号暂未完成：{exc}", flush=True)

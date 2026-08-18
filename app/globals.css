@@ -465,17 +465,24 @@ footer p { margin: 0; }
 .strategy-account-grid.history-summary article { min-height: 101px; padding: 15px; }
 .strategy-account-grid.history-summary strong { font-size: 15px; }
 .strategy-account-grid.history-summary .featured strong { font-size: 24px; }
+.strategy-next-open-summary { margin: 13px 0; padding: 14px 16px; border: 1px solid rgba(111,159,255,.17); border-radius: 10px; background: linear-gradient(100deg, rgba(111,159,255,.075), rgba(111,159,255,.018)); display: grid; grid-template-columns: 1.5fr repeat(3, minmax(110px, .7fr)); gap: 18px; align-items: center; }
+.strategy-next-open-summary > div { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.strategy-next-open-summary > div:not(:first-child) { padding-left: 16px; border-left: 1px solid rgba(255,255,255,.06); }
+.strategy-next-open-summary span { color: #697586; font-size: 7px; }
+.strategy-next-open-summary strong { font-size: 11px; }
+.strategy-next-open-summary > div:first-child strong { color: #d9e6fb; font-size: 12px; }
+.strategy-next-open-summary p { margin: 0; color: #718095; font-size: 7px; line-height: 1.55; }
 .history-replay-chart .strategy-equity-canvas { height: 360px; }
 .strategy-history-rule { margin-top: 13px; padding: 13px 15px; border: 1px solid rgba(111,159,255,.14); border-radius: 9px; background: rgba(111,159,255,.035); display: grid; grid-template-columns: 70px 1fr; gap: 12px; }
 .strategy-history-rule strong { color: #84abf5; font-size: 8px; }
 .strategy-history-rule p { margin: 0; color: #8d98a7; font-size: 8px; line-height: 1.65; }
 .strategy-history-trades { margin-top: 13px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .strategy-history-trade-list { max-height: 430px; overflow-y: auto; }
-.strategy-history-trade-list > a { min-height: 64px; padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,.05); color: inherit; display: grid; grid-template-columns: 1.35fr 1fr .7fr; gap: 14px; align-items: center; }
+.strategy-history-trade-list > a { min-height: 64px; padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,.05); color: inherit; display: grid; grid-template-columns: 1.25fr .85fr .7fr .9fr; gap: 14px; align-items: center; }
 .strategy-history-trade-list > a:last-child { border-bottom: 0; }
 .strategy-history-trade-list > a:hover { background: rgba(255,255,255,.025); }
 .strategy-history-trade-list > a > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.strategy-history-trade-list > a > div:last-child { text-align: right; }
+.strategy-history-trade-list > a > div:nth-last-child(-n+2) { text-align: right; }
 .strategy-history-trade-list strong { font-size: 9px; }
 .strategy-history-trade-list span, .strategy-history-trade-list small { color: #667180; font-size: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .strategy-history-grid { margin-top: 14px; display: grid; grid-template-columns: .9fr 1.1fr; gap: 14px; }
@@ -554,8 +561,9 @@ footer p { margin: 0; }
   .strategy-account-grid article:nth-child(2n) { border-right: 0; }
   .strategy-history-grid { grid-template-columns: 1fr; }
   .strategy-replay-history { grid-template-columns: 220px minmax(0, 1fr); }
+  .strategy-next-open-summary { grid-template-columns: 1fr 1fr; }
+  .strategy-next-open-summary > div:nth-child(3) { padding-left: 0; border-left: 0; }
   .strategy-history-trade-list > a { grid-template-columns: 1.2fr 1fr; }
-  .strategy-history-trade-list > a > div:last-child { grid-column: 1/-1; flex-direction: row; justify-content: space-between; text-align: left; }
 }
 
 @media (max-width: 700px) {
@@ -619,7 +627,9 @@ footer p { margin: 0; }
   .strategy-history-title { align-items: flex-start; flex-direction: column; }
   .strategy-history-rule { grid-template-columns: 1fr; }
   .strategy-history-trade-list > a { grid-template-columns: 1fr; }
-  .strategy-history-trade-list > a > div:last-child { grid-column: auto; }
+  .strategy-history-trade-list > a > div:nth-last-child(-n+2) { text-align: left; }
+  .strategy-next-open-summary { grid-template-columns: 1fr; }
+  .strategy-next-open-summary > div:not(:first-child) { padding: 9px 0 0; border-left: 0; border-top: 1px solid rgba(255,255,255,.06); }
   .strategy-readable-rule, .strategy-data-notice { grid-template-columns: 1fr; }
   .strategy-builder-actions { align-items: stretch; flex-direction: column; }
   .strategy-builder-actions button { width: 100%; }
