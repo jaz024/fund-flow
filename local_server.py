@@ -45,7 +45,7 @@ EASTMONEY_MINUTE_SOURCE = "东方财富真实分钟资金（延时）"
 STOCK_SOURCE_NAME = "东方财富公开个股行情（延时）"
 SINA_STOCK_SOURCE = "新浪财经公开个股行情"
 TENCENT_STOCK_SOURCE = "腾讯证券公开个股行情"
-API_VERSION = 9
+API_VERSION = 11
 THS_SOURCE_NAME = "同花顺公开网页"
 EASTMONEY_UT = "b2884a393a59ad64002292a3e90d46a5"
 EASTMONEY_CHANGE_UT = "7eea3edcaed734bea9cbfc24409ed989"
@@ -1004,6 +1004,10 @@ STRATEGY_COMMISSION_RATE = 0.00025
 STRATEGY_TRANSFER_AND_REGULATORY_RATE = 0.0000541
 STRATEGY_STAMP_DUTY_RATE = 0.0005
 STRATEGY_SLIPPAGE_RATE = 0.0005
+STRATEGY_LAB_MIN_CAPITAL = 100_000.0
+STRATEGY_LAB_MAX_CAPITAL = 1_000_000.0
+STRATEGY_LAB_PREVIEW_RETENTION_DAYS = 7
+STRATEGY_LAB_CAPITAL_SCHEMA_VERSION = 2
 STRATEGY_LAB_DEFAULT_CONFIG: dict[str, Any] = {
     "name": "板块确认追涨",
     "signalModel": "rapid_rise",
@@ -1025,7 +1029,7 @@ STRATEGY_LAB_DEFAULT_CONFIG: dict[str, Any] = {
     "exitMode": "next_0931",
     "takeProfitPct": 3.0,
     "stopLossPct": 1.5,
-    "initialCapital": 100_000.0,
+    "initialCapital": STRATEGY_LAB_MAX_CAPITAL,
 }
 
 STRATEGY_LAB_PRESETS: list[dict[str, Any]] = [
@@ -2157,7 +2161,7 @@ def validate_strategy_lab_config(raw: Any) -> dict[str, Any]:
         "exitMode": choice("exitMode", {"next_open", "next_0931", "risk_close", "model_reverse", "hold"}),
         "takeProfitPct": round(bounded("takeProfitPct", 0, 30), 2),
         "stopLossPct": round(bounded("stopLossPct", 0, 20), 2),
-        "initialCapital": round(bounded("initialCapital", 10_000, 100_000_000), 2),
+        "initialCapital": round(bounded("initialCapital", STRATEGY_LAB_MIN_CAPITAL, STRATEGY_LAB_MAX_CAPITAL), 2),
     }
     if result["startTime"] >= result["endTime"]:
         result["startTime"], result["endTime"] = "09:45", "14:50"
@@ -2194,7 +2198,7 @@ def strategy_lab_summary(config: dict[str, Any]) -> str:
     vwap_text = {"any": "不限制VWAP", "above": "价格在VWAP上方", "below": "价格在VWAP下方"}[config["vwapFilter"]]
     volume_text = "不限制分钟量比" if config["minVolumeRatio"] <= 0 else f"分钟量比至少 {config['minVolumeRatio']:.2f}"
     return (
-        f"{scope}中，{model_text}、{vwap_text}、{volume_text}、{sector}、"
+        f"单日回放资金{config['initialCapital'] / 10_000:.0f}万元；{scope}中，{model_text}、{vwap_text}、{volume_text}、{sector}、"
         f"累计成交额不少于 {config['minAmount'] / 100_000_000:.2f}亿元且评分达到 {config['minScore']:.1f} 时，"
         f"延迟 {config['buyDelayMinutes']} 分钟按{price}模拟买入；{allocation}，最多 {config['maxPositions']} 只；{exit_text}。"
     )
@@ -2526,9 +2530,136 @@ def save_strategy_lab_preview(config: dict[str, Any], preview: dict[str, Any]) -
     payload = {
         "config": config,
         "savedAt": now_cn().isoformat(timespec="seconds"),
+        "capitalSchemaVersion": STRATEGY_LAB_CAPITAL_SCHEMA_VERSION,
         "preview": {**normalized, "isStale": False},
     }
     write_cache(strategy_lab_preview_cache_name(config, trading_date), payload)
+
+
+def rescale_strategy_lab_preview_capital(
+    preview: dict[str, Any],
+    target_capital: float,
+) -> dict[str, Any]:
+    """Scale a legacy replay without changing any saved prices or returns."""
+    normalized = normalize_strategy_lab_preview(preview)
+    original_capital = to_float(normalized.get("initialCapital"))
+    if original_capital <= 0 or target_capital <= 0 or abs(original_capital - target_capital) < 0.01:
+        return normalized
+    factor = target_capital / original_capital
+
+    scaled = dict(normalized)
+    scaled["initialCapital"] = target_capital
+    for field in ("portfolioValue", "cash", "marketValue", "fees", "nextOpenPortfolioValue"):
+        if scaled.get(field) is not None:
+            scaled[field] = to_float(scaled.get(field)) * factor
+
+    scaled_equity: list[dict[str, Any]] = []
+    for original in scaled.get("equity") or []:
+        point = dict(original)
+        for field in ("portfolioValue", "cash", "marketValue"):
+            if point.get(field) is not None:
+                point[field] = to_float(point.get(field)) * factor
+        scaled_equity.append(point)
+    scaled["equity"] = scaled_equity
+
+    scaled_trades: list[dict[str, Any]] = []
+    quantities: dict[tuple[str, str], tuple[int, int]] = {}
+    for original in scaled.get("trades") or []:
+        trade = dict(original)
+        old_quantity = int(trade.get("quantity") or 0)
+        new_quantity = int(round(old_quantity * factor))
+        trade["quantity"] = new_quantity
+        quantities[(str(trade.get("code") or ""), str(trade.get("executionTime") or trade.get("entryTime") or ""))] = (
+            old_quantity,
+            new_quantity,
+        )
+        for field in (
+            "entryCost", "debit", "currentValue", "unrealizedPnl",
+            "nextOpenExitCost", "nextOpenNetValue",
+        ):
+            if trade.get(field) is not None:
+                trade[field] = to_float(trade.get(field)) * factor
+        scaled_trades.append(trade)
+    scaled["trades"] = scaled_trades
+
+    scaled_events: list[dict[str, Any]] = []
+    for original in scaled.get("events") or []:
+        event = dict(original)
+        key = (str(event.get("code") or ""), str(event.get("time") or ""))
+        old_quantity, new_quantity = quantities.get(key, (int(event.get("quantity") or 0), 0))
+        if old_quantity > 0:
+            event["quantity"] = new_quantity or int(round(old_quantity * factor))
+            detail = str(event.get("detail") or "")
+            event["detail"] = detail.replace(f"{old_quantity}股", f"{event['quantity']}股")
+        if event.get("amount") is not None:
+            event["amount"] = to_float(event.get("amount")) * factor
+        scaled_events.append(event)
+    scaled["events"] = scaled_events
+    return scaled
+
+
+def maintain_strategy_lab_preview_cache(
+    reference_date: str,
+    *,
+    migrate_legacy_capital: bool = True,
+) -> dict[str, int]:
+    """Keep seven calendar days and remove unusable completed-day fragments."""
+    try:
+        current_date = dt.date.fromisoformat(reference_date)
+        cutoff = current_date - dt.timedelta(days=STRATEGY_LAB_PREVIEW_RETENTION_DAYS - 1)
+        paths = list(CACHE_DIR.glob("strategy-lab-preview-*.json"))
+    except (ValueError, OSError):
+        return {"deleted": 0, "migrated": 0}
+
+    deleted = 0
+    migrated = 0
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            preview = payload.get("preview") if isinstance(payload, dict) else None
+            replay_date = dt.date.fromisoformat(str((preview or {}).get("date") or ""))
+        except (OSError, json.JSONDecodeError, ValueError):
+            try:
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except OSError:
+                pass
+            continue
+
+        verified = str(preview.get("verifiedThrough") or "") if isinstance(preview, dict) else ""
+        unusable = not isinstance(preview, dict) or not preview.get("equity")
+        expired = replay_date < cutoff
+        abandoned_intraday = replay_date < current_date and verified < "15:00"
+        if unusable or expired or abandoned_intraday:
+            try:
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except OSError:
+                pass
+            continue
+
+        if (
+            migrate_legacy_capital
+            and int(payload.get("capitalSchemaVersion") or 0) < STRATEGY_LAB_CAPITAL_SCHEMA_VERSION
+            and abs(to_float(preview.get("initialCapital")) - 100_000.0) < 0.01
+        ):
+            config = validate_strategy_lab_config({**(payload.get("config") or {}), "initialCapital": STRATEGY_LAB_MAX_CAPITAL})
+            scaled = rescale_strategy_lab_preview_capital(preview, STRATEGY_LAB_MAX_CAPITAL)
+            payload.update({
+                "config": config,
+                "capitalSchemaVersion": STRATEGY_LAB_CAPITAL_SCHEMA_VERSION,
+                "capitalMigratedAt": now_cn().isoformat(timespec="seconds"),
+                "preview": {**scaled, "isStale": False},
+            })
+            new_cache_name = strategy_lab_preview_cache_name(config, replay_date.isoformat())
+            write_cache(new_cache_name, payload)
+            if new_cache_name != path.stem:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            migrated += 1
+    return {"deleted": deleted, "migrated": migrated}
 
 
 def load_strategy_lab_preview(
@@ -2557,7 +2688,7 @@ def load_strategy_lab_preview(
 
 
 def load_strategy_lab_preview_history(limit: int = 90) -> list[dict[str, Any]]:
-    """Return saved, reproducible daily replays for the local history browser."""
+    """Return only fully closed and next-open-settled daily replays."""
     records: list[dict[str, Any]] = []
     try:
         paths = list(CACHE_DIR.glob("strategy-lab-preview-*.json"))
@@ -2571,7 +2702,15 @@ def load_strategy_lab_preview_history(limit: int = 90) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             continue
         preview = payload.get("preview")
-        if not isinstance(preview, dict) or not preview.get("date") or not preview.get("equity"):
+        if (
+            not isinstance(preview, dict)
+            or not preview.get("date")
+            or not preview.get("equity")
+            or str(preview.get("verifiedThrough") or "") < "15:00"
+            or str(preview.get("nextOpenStatus") or "") != "complete"
+            or not preview.get("nextOpenDate")
+            or preview.get("nextOpenPortfolioValue") is None
+        ):
             continue
         config = validate_strategy_lab_config(payload.get("config"))
         date_label = str(preview.get("date") or "")
@@ -2582,7 +2721,7 @@ def load_strategy_lab_preview_history(limit: int = 90) -> list[dict[str, Any]]:
             "savedAt": str(payload.get("savedAt") or dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")),
             "date": date_label,
             "verifiedThrough": verified,
-            "sessionStatus": "closed" if verified >= "15:00" else "intraday",
+            "sessionStatus": "closed",
             "strategyName": str(config.get("name") or "已保存策略"),
             "strategySummary": strategy_lab_summary(config),
             "config": config,
@@ -2593,6 +2732,59 @@ def load_strategy_lab_preview_history(limit: int = 90) -> list[dict[str, Any]]:
         key=lambda item: (str(item["date"]), str(item["verifiedThrough"]), str(item["savedAt"])),
         reverse=True,
     )[: max(1, limit)]
+
+
+def finalize_strategy_lab_daily_previews(market: dict[str, Any], limit: int = 24) -> dict[str, int]:
+    """Refresh partial same-day replays once the real market cursor reaches the close.
+
+    This never attempts to reconstruct an older missing session. It only replaces a
+    saved intraday replay for the current market date while that day's complete
+    point-in-time signal and minute-price observations are available.
+    """
+    trading_date = str(market.get("date") or "")
+    verified = str(market.get("verifiedThrough") or "")
+    if not trading_date or verified < "15:00":
+        return {"finalized": 0, "failed": 0}
+
+    try:
+        paths = sorted(
+            CACHE_DIR.glob(f"strategy-lab-preview-{trading_date}-*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )[: max(1, limit)]
+    except OSError:
+        return {"finalized": 0, "failed": 0}
+
+    finalized = 0
+    failed = 0
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            preview = payload.get("preview") if isinstance(payload, dict) else None
+            if (
+                not isinstance(preview, dict)
+                or str(preview.get("date") or "") != trading_date
+                or str(preview.get("verifiedThrough") or "") >= "15:00"
+            ):
+                continue
+            config = validate_strategy_lab_config(payload.get("config"))
+            refreshed = build_strategy_lab_preview(config, market)
+            if str(refreshed.get("verifiedThrough") or "") < "15:00" or not refreshed.get("equity"):
+                failed += 1
+                continue
+            saved_at = now_cn().isoformat(timespec="seconds")
+            write_cache(path.stem, {
+                "config": config,
+                "savedAt": saved_at,
+                "finalizedAt": saved_at,
+                "capitalSchemaVersion": int(payload.get("capitalSchemaVersion") or 0),
+                "preview": {**normalize_strategy_lab_preview(refreshed), "isStale": False},
+            })
+            finalized += 1
+        except Exception as exc:
+            failed += 1
+            print(f"收盘回放自动补全失败（{path.name}）：{exc}", flush=True)
+    return {"finalized": finalized, "failed": failed}
 
 
 def strategy_lab_preview_next_open_result(trade: dict[str, Any], raw_open: float) -> dict[str, float]:
@@ -2654,7 +2846,11 @@ def enrich_strategy_lab_preview_next_opens(current_trading_date: str, limit: int
         trades = list(normalized.get("trades") or [])
         needs_trade_open = any(to_float(trade.get("nextOpenPrice")) <= 0 for trade in trades)
         needs_benchmark_open = to_float(normalized.get("benchmarkNextOpenPrice")) <= 0
-        if not trades or (not needs_trade_open and not needs_benchmark_open):
+        if (
+            not needs_trade_open
+            and not needs_benchmark_open
+            and str(normalized.get("nextOpenStatus") or "") == "complete"
+        ):
             continue
         for trade in trades:
             if to_float(trade.get("nextOpenPrice")) <= 0:
@@ -2740,18 +2936,31 @@ def enrich_strategy_lab_preview_next_opens(current_trading_date: str, limit: int
             enriched_trades.append(trade)
         preview["trades"] = enriched_trades
 
+        prior_settlement = (
+            preview.get("nextOpenStatus"), preview.get("nextOpenDate"),
+            preview.get("nextOpenCompletedTrades"), preview.get("nextOpenPendingTrades"),
+            preview.get("nextOpenPortfolioValue"), preview.get("nextOpenReturnPct"),
+        )
         completed = [trade for trade in enriched_trades if to_float(trade.get("nextOpenPrice")) > 0]
         preview["nextOpenCompletedTrades"] = len(completed)
         preview["nextOpenPendingTrades"] = len(enriched_trades) - len(completed)
-        preview["nextOpenStatus"] = "complete" if len(completed) == len(enriched_trades) else "partial"
         next_dates = sorted({str(trade.get("nextOpenDate") or "") for trade in completed if trade.get("nextOpenDate")})
-        if next_dates:
-            preview["nextOpenDate"] = next_dates[-1]
-        if enriched_trades and len(completed) == len(enriched_trades):
+        settlement_date = next_dates[-1] if next_dates else expected_next_date
+        settlement_complete = bool(settlement_date) and len(completed) == len(enriched_trades)
+        preview["nextOpenStatus"] = "complete" if settlement_complete else "partial"
+        if settlement_date:
+            preview["nextOpenDate"] = settlement_date
+        if settlement_complete:
             portfolio_value = to_float(preview.get("cash")) + sum(to_float(trade.get("nextOpenNetValue")) for trade in completed)
             initial_capital = to_float(preview.get("initialCapital"))
             preview["nextOpenPortfolioValue"] = portfolio_value
             preview["nextOpenReturnPct"] = (portfolio_value / initial_capital - 1) * 100 if initial_capital > 0 else 0
+        current_settlement = (
+            preview.get("nextOpenStatus"), preview.get("nextOpenDate"),
+            preview.get("nextOpenCompletedTrades"), preview.get("nextOpenPendingTrades"),
+            preview.get("nextOpenPortfolioValue"), preview.get("nextOpenReturnPct"),
+        )
+        changed = changed or current_settlement != prior_settlement
         preview["nextOpenUpdatedAt"] = now_cn().isoformat(timespec="seconds")
 
         if changed:
@@ -3320,6 +3529,7 @@ def handle_strategy_lab_action(payload: dict[str, Any]) -> dict[str, Any]:
             preview = build_strategy_lab_preview(config, market)
             save_strategy_lab_preview(config, preview)
             enrich_strategy_lab_preview_next_opens(str(market["date"]))
+            maintain_strategy_lab_preview_cache(str(market["date"]))
             return serialize_strategy_lab_state(STORE.load_strategy_lab_state(), market, preview)
         if action in {"start", "update", "resume"}:
             # A rule change becomes effective at the current verified minute.
@@ -4034,8 +4244,22 @@ def background_strategy_collector(stop_event: threading.Event) -> None:
             try:
                 with _STRATEGY_LAB_LOCK:
                     market = prepare_strategy_lab_market()
-                    process_continuous_strategy_lab(market)
-                    enrich_strategy_lab_preview_next_opens(str(market["date"]))
+                    try:
+                        process_continuous_strategy_lab(market)
+                    except Exception as exc:
+                        print(f"持续模拟账户更新暂未完成：{exc}", flush=True)
+                    try:
+                        finalize_strategy_lab_daily_previews(market)
+                    except Exception as exc:
+                        print(f"收盘回放自动补全暂未完成：{exc}", flush=True)
+                    try:
+                        enrich_strategy_lab_preview_next_opens(str(market["date"]))
+                    except Exception as exc:
+                        print(f"次日开盘结算暂未完成：{exc}", flush=True)
+                    try:
+                        maintain_strategy_lab_preview_cache(str(market["date"]))
+                    except Exception as exc:
+                        print(f"历史回放留存整理暂未完成：{exc}", flush=True)
                 startup_reconciled = True
             except Exception as exc:
                 print(f"后台策略信号暂未完成：{exc}", flush=True)

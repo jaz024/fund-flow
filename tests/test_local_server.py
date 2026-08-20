@@ -357,11 +357,14 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(preview["trades"][0]["executionTime"], "10:01")
         self.assertEqual(preview["trades"][0]["quantity"] % 100, 0)
         self.assertIsNone(server.STORE.load_strategy_lab_state()["account"])
-        self.assertLess(max(point["portfolioValue"] for point in preview["equity"]), 101_000)
+        self.assertLess(max(point["portfolioValue"] for point in preview["equity"]), 1_010_000)
 
     def test_strategy_lab_presets_cover_distinct_causal_models(self) -> None:
         presets = {item["id"]: server.validate_strategy_lab_config(item["config"]) for item in server.STRATEGY_LAB_PRESETS}
         self.assertEqual(set(presets), {"rapid_rise", "trend", "mean_reversion", "volatility_breakout"})
+        self.assertEqual(server.validate_strategy_lab_config({})["initialCapital"], 1_000_000)
+        self.assertEqual(server.validate_strategy_lab_config({"initialCapital": 50_000})["initialCapital"], 100_000)
+        self.assertEqual(server.validate_strategy_lab_config({"initialCapital": 2_000_000})["initialCapital"], 1_000_000)
         self.assertEqual(presets["mean_reversion"]["vwapFilter"], "below")
         self.assertEqual(presets["trend"]["exitMode"], "model_reverse")
         self.assertEqual(presets["volatility_breakout"]["vwapFilter"], "above")
@@ -445,11 +448,7 @@ class LocalServerTests(unittest.TestCase):
         }))
 
         history = server.load_strategy_lab_preview_history()
-        self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["date"], "2026-08-13")
-        self.assertEqual(history[0]["strategyName"], config["name"])
-        self.assertEqual(history[0]["sessionStatus"], "intraday")
-        self.assertEqual(history[0]["preview"]["portfolioValue"], 100_100)
+        self.assertEqual(history, [])
 
     def test_strategy_lab_history_normalizes_legacy_execution_fields(self) -> None:
         config = server.validate_strategy_lab_config({})
@@ -457,6 +456,10 @@ class LocalServerTests(unittest.TestCase):
         legacy_preview = {
             "date": trading_date,
             "verifiedThrough": "15:00",
+            "initialCapital": 1_000_000,
+            "nextOpenStatus": "complete",
+            "nextOpenDate": "2026-08-13",
+            "nextOpenPortfolioValue": 1_005_000,
             "equity": [{"date": trading_date, "time": "15:00", "returnPct": 0.5}],
             "trades": [{
                 "code": "000001", "market": 0, "name": "平安银行", "quantity": 100,
@@ -526,6 +529,153 @@ class LocalServerTests(unittest.TestCase):
         self.assertEqual(enriched["nextOpenCompletedTrades"], 1)
         self.assertGreater(enriched["nextOpenReturnPct"], 0)
         self.assertAlmostEqual(enriched["benchmarkNextOpenGapPct"], (4040 / 4020 - 1) * 100)
+
+    def test_complete_zero_trade_day_settles_on_next_market_open(self) -> None:
+        config = server.validate_strategy_lab_config({})
+        trading_date = "2026-08-18"
+        preview = {
+            "date": trading_date, "verifiedThrough": "15:00", "initialCapital": 1_000_000,
+            "portfolioValue": 1_000_000, "cash": 1_000_000, "marketValue": 0,
+            "returnPct": 0, "benchmarkReturnPct": 0.2, "fees": 0,
+            "signalsMatched": 0, "tradesFilled": 0, "failedOrders": 0,
+            "openPositions": 0, "winningPositions": 0,
+            "equity": [{"date": trading_date, "time": "15:00", "portfolioValue": 1_000_000, "returnPct": 0}],
+            "trades": [], "events": [],
+        }
+        server.save_strategy_lab_preview(config, preview)
+        benchmark = {
+            "points": [
+                {"date": trading_date, "open": 4000, "close": 4020},
+                {"date": "2026-08-19", "open": 4030, "close": 4040},
+            ],
+            "source": "真实指数日线",
+        }
+
+        with mock.patch.object(server, "fetch_stock_daily", return_value=benchmark):
+            result = server.enrich_strategy_lab_preview_next_opens("2026-08-19")
+
+        self.assertEqual(result, {"updated": 1, "pending": 0})
+        history = server.load_strategy_lab_preview_history()
+        self.assertEqual(len(history), 1)
+        settled = history[0]["preview"]
+        self.assertEqual(settled["nextOpenStatus"], "complete")
+        self.assertEqual(settled["nextOpenDate"], "2026-08-19")
+        self.assertEqual(settled["nextOpenPortfolioValue"], 1_000_000)
+        self.assertEqual(settled["nextOpenReturnPct"], 0)
+
+    def test_strategy_lab_cache_keeps_seven_calendar_days_and_hides_pending_days(self) -> None:
+        legacy_config = server.validate_strategy_lab_config({"initialCapital": 100_000})
+        settled_date = "2026-08-17"
+        settled = {
+            "date": settled_date, "verifiedThrough": "15:00", "initialCapital": 100_000,
+            "portfolioValue": 100_500, "cash": 90_000, "marketValue": 10_500,
+            "nextOpenStatus": "complete", "nextOpenDate": "2026-08-18",
+            "nextOpenPortfolioValue": 101_000, "nextOpenReturnPct": 1,
+            "equity": [{
+                "date": settled_date, "time": "15:00", "portfolioValue": 100_500,
+                "cash": 90_000, "marketValue": 10_500, "returnPct": 0.5,
+            }],
+            "trades": [{
+                "code": "000001", "executionTime": "10:01", "entryPrice": 10,
+                "quantity": 100, "debit": 1_001, "nextOpenNetValue": 1_010,
+            }],
+            "events": [{
+                "date": settled_date, "time": "10:01", "type": "buy", "code": "000001",
+                "name": "平安银行", "title": "买入", "detail": "100股", "price": 10, "quantity": 100,
+            }],
+        }
+        server.write_cache(server.strategy_lab_preview_cache_name(legacy_config, settled_date), {
+            "config": legacy_config, "savedAt": f"{settled_date}T15:01:00", "preview": settled,
+        })
+        server.write_cache(server.strategy_lab_preview_cache_name(legacy_config, "2026-08-18"), {
+            "config": legacy_config, "savedAt": "2026-08-18T09:31:00",
+            "preview": {
+                "date": "2026-08-18", "verifiedThrough": "09:30", "initialCapital": 100_000,
+                "equity": [{"date": "2026-08-18", "time": "09:30", "portfolioValue": 100_000}],
+            },
+        })
+        current_config = server.validate_strategy_lab_config({})
+        server.save_strategy_lab_preview(current_config, {
+            "date": "2026-08-19", "verifiedThrough": "15:00", "initialCapital": 1_000_000,
+            "portfolioValue": 1_000_000, "cash": 1_000_000,
+            "equity": [{"date": "2026-08-19", "time": "15:00", "portfolioValue": 1_000_000}],
+            "trades": [], "events": [],
+        })
+        server.write_cache(server.strategy_lab_preview_cache_name(legacy_config, "2026-08-12"), {
+            "config": legacy_config, "savedAt": "2026-08-12T15:01:00",
+            "preview": {
+                "date": "2026-08-12", "verifiedThrough": "15:00", "initialCapital": 100_000,
+                "equity": [{"date": "2026-08-12", "time": "15:00", "portfolioValue": 100_000}],
+            },
+        })
+
+        result = server.maintain_strategy_lab_preview_cache("2026-08-19")
+
+        self.assertEqual(result, {"deleted": 2, "migrated": 1})
+        history = server.load_strategy_lab_preview_history()
+        self.assertEqual(len(history), 1)
+        migrated = history[0]["preview"]
+        self.assertEqual(migrated["initialCapital"], 1_000_000)
+        self.assertEqual(migrated["nextOpenPortfolioValue"], 1_010_000)
+        self.assertEqual(migrated["trades"][0]["quantity"], 1_000)
+        self.assertEqual(migrated["events"][0]["quantity"], 1_000)
+        self.assertEqual(len(list(server.CACHE_DIR.glob("strategy-lab-preview-*.json"))), 2)
+
+    def test_strategy_lab_partial_replay_is_finalized_at_same_day_close(self) -> None:
+        config = server.validate_strategy_lab_config({"name": "收盘自动补全测试"})
+        trading_date = "2026-08-18"
+        server.write_cache(server.strategy_lab_preview_cache_name(config, trading_date), {
+            "config": config,
+            "savedAt": f"{trading_date}T09:31:00",
+            "preview": {
+                "date": trading_date,
+                "verifiedThrough": "09:30",
+                "equity": [{"date": trading_date, "time": "09:30", "returnPct": 0}],
+                "trades": [],
+            },
+        })
+        market = {"date": trading_date, "verifiedThrough": "15:00", "index": {"points": []}}
+        completed = {
+            "date": trading_date,
+            "verifiedThrough": "15:00",
+            "equity": [{"date": trading_date, "time": "15:00", "returnPct": 0.8}],
+            "trades": [{"code": "000001", "entryTime": "10:01", "entryPrice": 10}],
+        }
+
+        with mock.patch.object(server, "build_strategy_lab_preview", return_value=completed) as build:
+            result = server.finalize_strategy_lab_daily_previews(market)
+
+        self.assertEqual(result, {"finalized": 1, "failed": 0})
+        build.assert_called_once_with(config, market)
+        self.assertEqual(server.load_strategy_lab_preview_history(), [])
+        restored = server.load_strategy_lab_preview(config, market)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored["verifiedThrough"], "15:00")
+        self.assertEqual(restored["trades"][0]["executionTime"], "10:01")
+
+    def test_strategy_lab_partial_replay_is_not_fabricated_before_close_or_on_another_day(self) -> None:
+        config = server.validate_strategy_lab_config({})
+        server.write_cache(server.strategy_lab_preview_cache_name(config, "2026-08-18"), {
+            "config": config,
+            "savedAt": "2026-08-18T09:31:00",
+            "preview": {
+                "date": "2026-08-18", "verifiedThrough": "09:30",
+                "equity": [{"date": "2026-08-18", "time": "09:30", "returnPct": 0}],
+            },
+        })
+
+        with mock.patch.object(
+            server, "build_strategy_lab_preview", side_effect=AssertionError("must not reconstruct missing history"),
+        ):
+            before_close = server.finalize_strategy_lab_daily_previews({
+                "date": "2026-08-18", "verifiedThrough": "14:59",
+            })
+            next_day = server.finalize_strategy_lab_daily_previews({
+                "date": "2026-08-19", "verifiedThrough": "15:00",
+            })
+
+        self.assertEqual(before_close, {"finalized": 0, "failed": 0})
+        self.assertEqual(next_day, {"finalized": 0, "failed": 0})
 
     def test_strategy_lab_page_read_never_starts_a_network_crawl(self) -> None:
         with mock.patch.object(

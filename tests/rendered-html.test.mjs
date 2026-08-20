@@ -52,4 +52,5 @@ test("renders the composable quantitative strategy laboratory", async () => {
   assert.match(html, /可验证的策略/);
   assert.match(html, /模型可以逆势买入/);
   assert.match(html, /策略实验室/);
+  assert.match(html, /data-fund-flow-version="10"/);
 });

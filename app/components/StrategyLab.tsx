@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import StrategyEquityChart from "./StrategyEquityChart";
-import type { StrategyLabConfig, StrategyLabData, StrategyLabPosition } from "../lib/types";
+import type { StrategyLabConfig, StrategyLabData, StrategyLabEvent, StrategyLabPosition, StrategyLabPreview } from "../lib/types";
 import { fetchJson, formatPercent, postJson } from "../lib/types";
 
 const scopeNames = { all: "沪深京 A股", sh: "沪市 A股", sz: "深市 A股", bj: "北交所" } as const;
@@ -12,6 +12,9 @@ const priceNames = { minute_open: "目标分钟开盘价", minute_close: "目标
 const exitNames = { next_open: "次日开盘", next_0931: "次日 09:31", risk_close: "止盈/止损，否则次日收盘", model_reverse: "T+1 后由反向模型退出", hold: "持续持有" } as const;
 const modelNames = { rapid_rise: "一分钟异动追涨", trend: "短线趋势延续", mean_reversion: "超跌均值回归", volatility_breakout: "放量波动突破" } as const;
 const vwapNames = { any: "不使用 VWAP", above: "价格高于 VWAP", below: "价格低于 VWAP" } as const;
+const replayCapitalStorageKey = "fund-flow-replay-capital";
+const minimumReplayCapital = 100_000;
+const maximumReplayCapital = 1_000_000;
 
 function money(value: number) {
   return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 2 }).format(value);
@@ -27,7 +30,14 @@ function strategySentence(config: StrategyLabConfig) {
         ? `${config.lookbackMinutes}分钟上涨 ≥ ${config.oneMinuteRise.toFixed(2)}%`
         : `突破此前${config.lookbackMinutes}分钟高点 ≥ ${config.oneMinuteRise.toFixed(2)}%`;
   const volume = config.minVolumeRatio > 0 ? `分钟量比 ≥ ${config.minVolumeRatio.toFixed(2)}` : "不限分钟量比";
-  return `${scopeNames[config.marketScope]}中，${config.startTime}–${config.endTime} 由“${modelNames[config.signalModel]}”检测到${trigger}，并满足${vwapNames[config.vwapFilter]}、${volume}、${sectorNames[config.sectorFilter]}、成交额 ≥ ${(config.minAmount / 100_000_000).toFixed(2)}亿及评分 ≥ ${config.minScore.toFixed(1)}后，延迟 ${config.buyDelayMinutes} 分钟按${priceNames[config.entryPriceMode]}买入；${allocation}，最多 ${config.maxPositions} 只，${exitNames[config.exitMode]}。`;
+  return `单日回放资金 ${money(config.initialCapital)}；${scopeNames[config.marketScope]}中，${config.startTime}–${config.endTime} 由“${modelNames[config.signalModel]}”检测到${trigger}，并满足${vwapNames[config.vwapFilter]}、${volume}、${sectorNames[config.sectorFilter]}、成交额 ≥ ${(config.minAmount / 100_000_000).toFixed(2)}亿及评分 ≥ ${config.minScore.toFixed(1)}后，延迟 ${config.buyDelayMinutes} 分钟按${priceNames[config.entryPriceMode]}买入；${allocation}，最多 ${config.maxPositions} 只，${exitNames[config.exitMode]}。`;
+}
+
+function storedReplayCapital(fallback: number) {
+  const saved = Number(window.localStorage.getItem(replayCapitalStorageKey));
+  return Number.isFinite(saved) && saved >= minimumReplayCapital && saved <= maximumReplayCapital
+    ? saved
+    : fallback;
 }
 
 function positionPrice(position: StrategyLabPosition) {
@@ -48,6 +58,45 @@ function replayNextOpenPrice(position: StrategyLabPosition) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value.toFixed(2) : "等待补录";
 }
 
+function completedHistoryReplay(preview: StrategyLabPreview) {
+  const points = [...preview.equity];
+  const events = [...preview.events];
+  if (
+    preview.nextOpenStatus !== "complete"
+    || !preview.nextOpenDate
+    || preview.nextOpenPortfolioValue === undefined
+    || preview.nextOpenReturnPct === undefined
+  ) {
+    return { points, events };
+  }
+  const previous = points.at(-1);
+  const benchmarkReturn = previous
+    ? ((1 + previous.benchmarkReturnPct / 100) * (1 + (preview.benchmarkNextOpenGapPct || 0) / 100) - 1) * 100
+    : preview.benchmarkNextOpenGapPct || 0;
+  points.push({
+    date: preview.nextOpenDate,
+    time: "09:30",
+    portfolioValue: preview.nextOpenPortfolioValue,
+    cash: preview.nextOpenPortfolioValue,
+    marketValue: 0,
+    returnPct: preview.nextOpenReturnPct,
+    benchmarkReturnPct: benchmarkReturn,
+  });
+  const liquidation: StrategyLabEvent = {
+    date: preview.nextOpenDate,
+    time: "09:30",
+    type: "sell",
+    code: "",
+    name: "全部持仓",
+    title: "次日开盘全部卖出",
+    detail: `${preview.nextOpenCompletedTrades || preview.tradesFilled} 只股票按真实开盘价完成模拟卖出`,
+    price: 0,
+    quantity: preview.trades.reduce((total, trade) => total + trade.quantity, 0),
+  };
+  events.push(liquidation);
+  return { points, events };
+}
+
 export default function StrategyLab() {
   const [data, setData] = useState<StrategyLabData | null>(null);
   const [config, setConfig] = useState<StrategyLabConfig | null>(null);
@@ -60,6 +109,7 @@ export default function StrategyLab() {
   const [replayView, setReplayView] = useState<"today" | "history">("today");
   const [selectedHistoryId, setSelectedHistoryId] = useState("");
   const autoReplayStarted = useRef(false);
+  const account = data?.account;
 
   const load = useCallback(async () => {
     try {
@@ -68,7 +118,14 @@ export default function StrategyLab() {
         ...result,
         preview: dirty ? previous?.preview ?? result.preview ?? null : result.preview ?? previous?.preview ?? null,
       }));
-      setConfig((previous) => previous && dirty ? previous : result.account ? result.activeConfig : result.defaultConfig);
+      setConfig((previous) => {
+        if (previous && dirty) return previous;
+        const base = result.account ? result.activeConfig : result.defaultConfig;
+        return {
+          ...base,
+          initialCapital: storedReplayCapital(result.defaultConfig.initialCapital),
+        };
+      });
       if (result.preview) autoReplayStarted.current = true;
       setError("");
     } catch (reason) {
@@ -94,12 +151,15 @@ export default function StrategyLab() {
   }, [working]);
 
   const update = <K extends keyof StrategyLabConfig>(key: K, value: StrategyLabConfig[K]) => {
+    if (key === "initialCapital") {
+      window.localStorage.setItem(replayCapitalStorageKey, String(value));
+    }
     setDirty(true);
     setConfig((current) => current ? { ...current, [key]: value } : current);
   };
 
   const applyPreset = (preset: StrategyLabData["presets"][number]) => {
-    setConfig({ ...preset.config, initialCapital: account?.initialCash || config?.initialCapital || preset.config.initialCapital });
+    setConfig({ ...preset.config, initialCapital: config?.initialCapital || maximumReplayCapital });
     setDirty(true);
   };
 
@@ -109,14 +169,17 @@ export default function StrategyLab() {
     setWorking(action === "update" ? "start" : action);
     setError("");
     try {
-      const result = await postJson<StrategyLabData>("/api/strategy/lab", { action, config });
+      const submittedConfig = action !== "preview" && account
+        ? { ...config, initialCapital: account.initialCash }
+        : config;
+      const result = await postJson<StrategyLabData>("/api/strategy/lab", { action, config: submittedConfig });
       if (action === "preview") {
         autoReplayStarted.current = true;
         setData(result);
       } else {
         autoReplayStarted.current = Boolean(result.preview);
         setData(result);
-        setConfig(result.activeConfig);
+        setConfig({ ...result.activeConfig, initialCapital: config?.initialCapital || result.defaultConfig.initialCapital });
         setDirty(false);
       }
     } catch (reason) {
@@ -125,7 +188,7 @@ export default function StrategyLab() {
       setWorking("");
       setWorkingSeconds(0);
     }
-  }, [config]);
+  }, [account, config]);
 
   useEffect(() => {
     if (loading || !data || !config || data.preview || working || autoReplayStarted.current) return;
@@ -141,10 +204,13 @@ export default function StrategyLab() {
       : "行情源响应较慢，正在保留已完成的核验结果";
 
   const summary = useMemo(() => config ? strategySentence(config) : "", [config]);
-  const account = data?.account;
   const preview = data?.preview;
-  const previewHistory = (data?.previewHistory || []).filter((record) => record.date !== data?.date);
+  const previewHistory = data?.previewHistory || [];
   const selectedHistory = previewHistory.find((record) => record.id === selectedHistoryId) || previewHistory[0] || null;
+  const historyReplay = useMemo(
+    () => selectedHistory ? completedHistoryReplay(selectedHistory.preview) : { points: [], events: [] },
+    [selectedHistory],
+  );
   const openPositions = data?.positions.filter((position) => position.status === "open") || [];
 
   if (loading && !data) {
@@ -197,7 +263,7 @@ export default function StrategyLab() {
         <label><span>卖出规则</span><select value={config.exitMode} onChange={(event) => update("exitMode", event.target.value as StrategyLabConfig["exitMode"])}><option value="model_reverse">T+1 后由反向模型退出</option><option value="next_open">次一交易日开盘</option><option value="next_0931">次一交易日 09:31</option><option value="risk_close">止盈/止损，否则次日收盘</option><option value="hold">持续持有</option></select></label>
         <label><span>止盈</span><div className="strategy-input-unit"><input type="number" min="0" max="30" step="0.5" value={config.takeProfitPct} disabled={!(["risk_close", "model_reverse"] as string[]).includes(config.exitMode)} onChange={(event) => update("takeProfitPct", Number(event.target.value))} /><i>%</i></div></label>
         <label><span>止损</span><div className="strategy-input-unit"><input type="number" min="0" max="20" step="0.5" value={config.stopLossPct} disabled={!(["risk_close", "model_reverse"] as string[]).includes(config.exitMode)} onChange={(event) => update("stopLossPct", Number(event.target.value))} /><i>%</i></div></label>
-        <label><span>初始模拟资金</span><div className="strategy-input-unit"><input type="number" min="10000" max="100000000" step="10000" value={account?.initialCash || config.initialCapital} disabled={Boolean(account)} onChange={(event) => update("initialCapital", Number(event.target.value))} /><i>元</i></div></label>
+        <label className="strategy-capital-slider"><div><span>单日回放投资资金</span><strong>{money(config.initialCapital)}</strong></div><input aria-label="单日回放投资资金" type="range" min={minimumReplayCapital} max={maximumReplayCapital} step="10000" value={config.initialCapital} onChange={(event) => update("initialCapital", Number(event.target.value))} /><p><span>¥10万</span><em>每格 ¥1万</em><span>¥100万</span></p>{account && <small>持续账户仍按启动时的 {money(account.initialCash)} 运行；滑杆只改变每日回放预算。</small>}</label>
       </div></div>
 
       <div className="strategy-readable-rule"><span>当前规则</span><p>{summary}</p></div>
@@ -229,19 +295,20 @@ export default function StrategyLab() {
         </div>
         {preview && <p className="strategy-chart-note">{preview.notice}</p>}
       </> : <div className="strategy-replay-history">
-        <aside className="strategy-replay-list"><div className="strategy-replay-list-heading"><strong>已保存回放</strong><span>{previewHistory.length} 个版本</span></div>{previewHistory.map((record) => <button className={selectedHistory?.id === record.id ? "active" : ""} type="button" key={record.id} onClick={() => setSelectedHistoryId(record.id)}><span>{record.date}<i>{record.sessionStatus === "closed" ? "已收盘" : `至 ${record.verifiedThrough}`}</i></span><strong>{record.strategyName}</strong><div><em className={record.preview.returnPct >= 0 ? "up" : "down"}>{formatPercent(record.preview.returnPct, 3)}</em><small>{record.preview.tradesFilled} 笔成交</small></div></button>)}{!previewHistory.length && <div className="strategy-empty">还没有保存的每日回放。完成一次“回放今日数据”后会自动出现在这里。</div>}</aside>
+        <aside className="strategy-replay-list"><div className="strategy-replay-list-heading"><strong>已结算回放</strong><span>{previewHistory.length} 个版本</span></div>{previewHistory.map((record) => <button className={selectedHistory?.id === record.id ? "active" : ""} type="button" key={record.id} onClick={() => setSelectedHistoryId(record.id)}><span>{record.date}<i>次日开盘已结算</i></span><strong>{record.strategyName}</strong><div><em className={(record.preview.nextOpenReturnPct ?? 0) >= 0 ? "up" : "down"}>{formatPercent(record.preview.nextOpenReturnPct ?? 0, 3)}</em><small>次日开盘卖出 {formatPercent(record.preview.nextOpenReturnPct ?? 0, 3)}</small></div></button>)}{!previewHistory.length && <div className="strategy-empty">还没有完成次日开盘结算的回放。当天数据会先在本机保存，取得下一交易日真实开盘价后才会显示。</div>}</aside>
         <div className="strategy-replay-detail">{selectedHistory ? <>
-          <div className="strategy-history-title"><div><span>{selectedHistory.date} · {selectedHistory.verifiedThrough}</span><h3>{selectedHistory.strategyName}</h3><p>{selectedHistory.sessionStatus === "closed" ? "完整收盘回放" : "盘中保存版本"} · 保存于 {selectedHistory.savedAt.replace("T", " ")}</p></div><span className="strategy-source-chip">已保存 · 不重算</span></div>
+          <div className="strategy-history-title"><div><span>{selectedHistory.date} · {selectedHistory.verifiedThrough}</span><h3>{selectedHistory.strategyName}</h3><p>{selectedHistory.preview.nextOpenStatus === "complete" ? `已延伸至 ${selectedHistory.preview.nextOpenDate} 09:30 并全部模拟卖出` : selectedHistory.sessionStatus === "closed" ? "当日数据已收盘，等待次一交易日开盘结算" : `这份记录只保存至 ${selectedHistory.verifiedThrough}，不是完整交易日`} · 保存于 {selectedHistory.savedAt.replace("T", " ")}</p></div><span className="strategy-source-chip">{selectedHistory.preview.nextOpenDate ? `${selectedHistory.preview.nextOpenDate} 开盘已结算` : selectedHistory.sessionStatus === "closed" ? "等待次日开盘" : "盘中记录"}</span></div>
+          <div className={`strategy-next-open-summary ${selectedHistory.preview.nextOpenStatus || "pending"}`}><div><span className="eyebrow">NEXT SESSION OPEN</span><strong>次一交易日开盘结算</strong><p>{selectedHistory.preview.nextOpenDate} 已用真实日线开盘价补录并模拟清仓</p></div><div><span>开盘全部卖出 · 组合含成本收益</span><strong className={(selectedHistory.preview.nextOpenReturnPct || 0) >= 0 ? "up" : "down"}>{formatPercent(selectedHistory.preview.nextOpenReturnPct ?? 0, 3)}</strong></div><div><span>中证全指隔夜开盘</span><strong className={(selectedHistory.preview.benchmarkNextOpenGapPct || 0) >= 0 ? "up" : "down"}>{selectedHistory.preview.benchmarkNextOpenGapPct === undefined ? "--" : formatPercent(selectedHistory.preview.benchmarkNextOpenGapPct, 3)}</strong></div><div><span>已结算持仓</span><strong>{selectedHistory.preview.nextOpenCompletedTrades || 0} / {selectedHistory.preview.tradesFilled}</strong></div></div>
+          {selectedHistory.preview.trades.length > 0 && <div className="strategy-next-open-prices"><div className="strategy-next-open-prices-heading"><div><strong>逐股次日开盘价</strong><span>开盘价与卖出收益均来自保存后的真实补录</span></div><span>{selectedHistory.preview.nextOpenDate}</span></div><div className="strategy-next-open-price-grid">{selectedHistory.preview.trades.map((trade) => <Link key={`next-open-${trade.code}-${replayEntryTime(trade)}`} href={`/stocks/${trade.code}?market=${trade.market}&name=${encodeURIComponent(trade.name)}`}><span>{trade.name}<small>{trade.code}</small></span><strong>{trade.nextOpenPrice ? `¥${replayNextOpenPrice(trade)}` : "--"}</strong><em className={(trade.nextOpenReturnAfterCostPct || 0) >= 0 ? "up" : "down"}>{trade.nextOpenReturnAfterCostPct === undefined ? "--" : `${formatPercent(trade.nextOpenReturnAfterCostPct, 3)} 已卖出`}</em></Link>)}</div></div>}
           <div className="strategy-account-grid history-summary">
-            <article className="featured"><span>期末组合价值</span><strong>{money(selectedHistory.preview.portfolioValue)}</strong><em className={selectedHistory.preview.returnPct >= 0 ? "up" : "down"}>{formatPercent(selectedHistory.preview.returnPct, 3)}</em></article>
-            <article><span>中证全指同期</span><strong className={selectedHistory.preview.benchmarkReturnPct >= 0 ? "up" : "down"}>{formatPercent(selectedHistory.preview.benchmarkReturnPct, 3)}</strong><small>超额 {formatPercent(selectedHistory.preview.returnPct - selectedHistory.preview.benchmarkReturnPct, 3)}</small></article>
+            <article className="featured"><span>{selectedHistory.preview.nextOpenDate} 09:30 结算价值</span><strong>{money(selectedHistory.preview.nextOpenPortfolioValue ?? selectedHistory.preview.portfolioValue)}</strong><em className={(selectedHistory.preview.nextOpenReturnPct ?? 0) >= 0 ? "up" : "down"}>{formatPercent(selectedHistory.preview.nextOpenReturnPct ?? 0, 3)}</em></article>
+            <article><span>中证全指同期</span><strong className={(historyReplay.points.at(-1)?.benchmarkReturnPct ?? 0) >= 0 ? "up" : "down"}>{formatPercent(historyReplay.points.at(-1)?.benchmarkReturnPct ?? 0, 3)}</strong><small>超额 {formatPercent((selectedHistory.preview.nextOpenReturnPct ?? 0) - (historyReplay.points.at(-1)?.benchmarkReturnPct ?? 0), 3)}</small></article>
             <article><span>信号 / 成交</span><strong>{selectedHistory.preview.signalsMatched} / {selectedHistory.preview.tradesFilled}</strong><small>{selectedHistory.preview.failedOrders} 个未成交</small></article>
-            <article><span>费用与滑点</span><strong>{money(selectedHistory.preview.fees)}</strong><small>期末现金 {money(selectedHistory.preview.cash)}</small></article>
+            <article><span>费用与滑点</span><strong>{money(selectedHistory.preview.fees)}</strong><small>卖出后现金 {money(selectedHistory.preview.nextOpenPortfolioValue ?? selectedHistory.preview.cash)}</small></article>
           </div>
-          <div className={`strategy-next-open-summary ${selectedHistory.preview.nextOpenStatus || "pending"}`}><div><span className="eyebrow">NEXT SESSION OPEN</span><strong>次一交易日开盘观察</strong><p>{selectedHistory.preview.nextOpenDate ? `${selectedHistory.preview.nextOpenDate} 已用真实日线开盘价补录` : "下一交易日开盘后自动补录；不会用估算价格代替"}</p></div><div><span>若开盘卖出 · 组合含成本收益</span><strong className={(selectedHistory.preview.nextOpenReturnPct || 0) >= 0 ? "up" : "down"}>{selectedHistory.preview.nextOpenReturnPct === undefined ? "等待开盘" : formatPercent(selectedHistory.preview.nextOpenReturnPct, 3)}</strong></div><div><span>中证全指隔夜开盘</span><strong className={(selectedHistory.preview.benchmarkNextOpenGapPct || 0) >= 0 ? "up" : "down"}>{selectedHistory.preview.benchmarkNextOpenGapPct === undefined ? "等待开盘" : formatPercent(selectedHistory.preview.benchmarkNextOpenGapPct, 3)}</strong></div><div><span>补录进度</span><strong>{selectedHistory.preview.nextOpenCompletedTrades || 0} / {selectedHistory.preview.tradesFilled}</strong></div></div>
-          <div className="strategy-chart-panel history-replay-chart"><div className="strategy-chart-legend"><span><i className="portfolio" />模拟组合</span><span><i className="benchmark" />中证全指</span><span><i className="buy" />买入</span></div><StrategyEquityChart points={selectedHistory.preview.equity} events={selectedHistory.preview.events} label={`${selectedHistory.date} 历史策略回放`} /></div>
+          <div className="strategy-chart-panel history-replay-chart"><div className="strategy-chart-legend"><span><i className="portfolio" />模拟组合</span><span><i className="benchmark" />中证全指</span><span><i className="buy" />买入</span><span><i className="sell" />次日开盘全部卖出</span></div><StrategyEquityChart points={historyReplay.points} events={historyReplay.events} label={`${selectedHistory.date} 至次一交易日开盘的完整策略回放`} /></div>
           <div className="strategy-history-rule"><strong>当日策略</strong><p>{selectedHistory.strategySummary}</p></div>
-          <div className="strategy-history-trades"><div className="strategy-subheading"><h3>当日模拟成交</h3><span>{selectedHistory.preview.tradesFilled} 笔</span></div><div className="strategy-history-trade-list">{selectedHistory.preview.trades.map((trade) => <Link key={`${trade.code}-${replayEntryTime(trade)}`} href={`/stocks/${trade.code}?market=${trade.market}&name=${encodeURIComponent(trade.name)}`}><div><strong>{trade.name}</strong><small>{trade.code} · {trade.modelLabel || "策略信号"} · {trade.signalTime}</small></div><div><span>{replayEntryTime(trade)} 买入 {trade.quantity}股</span><strong>{replayEntryPrice(trade)}</strong></div><div><span>当日收盘浮盈</span><strong className={(trade.unrealizedReturn || 0) >= 0 ? "up" : "down"}>{formatPercent(trade.unrealizedReturn || 0, 3)}</strong></div><div><span>{trade.nextOpenDate ? `${trade.nextOpenDate} 开盘` : "次日开盘"} · {replayNextOpenPrice(trade)}</span><strong className={(trade.nextOpenReturnAfterCostPct || 0) >= 0 ? "up" : "down"}>{trade.nextOpenReturnAfterCostPct === undefined ? "等待真实数据" : `${formatPercent(trade.nextOpenReturnAfterCostPct, 3)} · 若卖出`}</strong></div></Link>)}{!selectedHistory.preview.trades.length && <div className="strategy-empty">这个回放没有产生模拟成交。</div>}</div></div>
+          <div className="strategy-history-trades"><div className="strategy-subheading"><h3>当日模拟成交</h3><span>{selectedHistory.preview.tradesFilled} 笔</span></div><div className="strategy-history-trade-list">{selectedHistory.preview.trades.map((trade) => <Link key={`${trade.code}-${replayEntryTime(trade)}`} href={`/stocks/${trade.code}?market=${trade.market}&name=${encodeURIComponent(trade.name)}`}><div><strong>{trade.name}</strong><small>{trade.code} · {trade.modelLabel || "策略信号"} · {trade.signalTime}</small></div><div><span>{replayEntryTime(trade)} 买入 {trade.quantity}股</span><strong>{replayEntryPrice(trade)}</strong></div><div><span>当日收盘浮盈</span><strong className={(trade.unrealizedReturn || 0) >= 0 ? "up" : "down"}>{formatPercent(trade.unrealizedReturn || 0, 3)}</strong></div><div><span>{trade.nextOpenDate} 开盘 · {replayNextOpenPrice(trade)}</span><strong className={(trade.nextOpenReturnAfterCostPct || 0) >= 0 ? "up" : "down"}>{trade.nextOpenReturnAfterCostPct === undefined ? "--" : `${formatPercent(trade.nextOpenReturnAfterCostPct, 3)} · 已卖出`}</strong></div></Link>)}{!selectedHistory.preview.trades.length && <div className="strategy-empty">这个完整交易日没有产生模拟成交，次日开盘结算收益为 0.000%。</div>}</div></div>
         </> : <div className="strategy-empty">选择一个保存日期查看完整回放。</div>}</div>
       </div>}
     </section>
